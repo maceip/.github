@@ -1,0 +1,150 @@
+name: 'Size Diff'
+description: 'Compares APK size between current and base branch, posts PR comment with Diffuse output'
+
+inputs:
+  current-apk-path:
+    description: 'Path to the current APK'
+    required: true
+  base-apk-artifact:
+    description: 'Name of the artifact containing the base branch APK'
+    required: false
+    default: 'base-apk'
+  app-module:
+    description: 'App module path for building base APK'
+    required: false
+    default: 'app'
+  gradle-task:
+    description: 'Gradle task to build APK'
+    required: false
+    default: 'assembleDebug'
+  working-directory:
+    description: 'Working directory for Gradle commands'
+    required: false
+    default: '.'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Get current APK size
+      id: current
+      shell: bash
+      run: |
+        SIZE=$(stat -c%s "${{ inputs.current-apk-path }}")
+        SIZE_MB=$(echo "scale=2; $SIZE / 1048576" | bc)
+        echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+        echo "size_mb=$SIZE_MB" >> "$GITHUB_OUTPUT"
+        echo "Current APK: ${SIZE_MB} MB ($SIZE bytes)"
+
+    - name: Checkout base branch
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.base.sha }}
+        path: base-branch
+
+    - name: Build base branch APK
+      shell: bash
+      run: |
+        cd base-branch
+        if [ -f "${{ inputs.working-directory }}/gradlew" ]; then
+          cd "${{ inputs.working-directory }}"
+          chmod +x gradlew
+          ./gradlew ${{ inputs.gradle-task }} --no-daemon 2>/dev/null || true
+        fi
+      continue-on-error: true
+
+    - name: Find base APK and compute diff
+      id: diff
+      shell: bash
+      run: |
+        BASE_APK=$(find base-branch -name "*.apk" -path "*outputs/apk*" | head -1 || true)
+
+        if [ -z "$BASE_APK" ] || [ ! -f "$BASE_APK" ]; then
+          echo "No base APK found, reporting size only"
+          echo "has_base=false" >> "$GITHUB_OUTPUT"
+          echo "delta=N/A (no base)" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        BASE_SIZE=$(stat -c%s "$BASE_APK")
+        CURRENT_SIZE=${{ steps.current.outputs.size }}
+        DELTA=$((CURRENT_SIZE - BASE_SIZE))
+        DELTA_MB=$(echo "scale=2; $DELTA / 1048576" | bc)
+        BASE_MB=$(echo "scale=2; $BASE_SIZE / 1048576" | bc)
+
+        echo "has_base=true" >> "$GITHUB_OUTPUT"
+        echo "base_size=$BASE_SIZE" >> "$GITHUB_OUTPUT"
+        echo "base_size_mb=$BASE_MB" >> "$GITHUB_OUTPUT"
+        echo "delta=$DELTA" >> "$GITHUB_OUTPUT"
+        echo "delta_mb=$DELTA_MB" >> "$GITHUB_OUTPUT"
+
+        # Try Diffuse for detailed breakdown
+        DIFFUSE_URL="https://github.com/JakeWharton/diffuse/releases/download/0.3.0/diffuse-0.3.0-binary.jar"
+        curl -fsSL "$DIFFUSE_URL" -o diffuse.jar 2>/dev/null || true
+
+        if [ -f diffuse.jar ]; then
+          java -jar diffuse.jar diff --apk "$BASE_APK" "${{ inputs.current-apk-path }}" > diffuse-output.txt 2>/dev/null || true
+        fi
+
+    - name: Post PR comment
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const currentMb = '${{ steps.current.outputs.size_mb }}';
+          const hasBase = '${{ steps.diff.outputs.has_base }}' === 'true';
+          const deltaMb = '${{ steps.diff.outputs.delta_mb }}';
+          const baseMb = '${{ steps.diff.outputs.base_size_mb }}';
+          const delta = parseInt('${{ steps.diff.outputs.delta }}' || '0');
+
+          let icon = '';
+          if (hasBase) {
+            if (delta > 1048576) icon = '🔴';
+            else if (delta > 0) icon = '🟡';
+            else icon = '🟢';
+          }
+
+          let body = `## APK Size Report ${icon}\n\n`;
+          body += `| Metric | Value |\n|--------|-------|\n`;
+          body += `| Current | ${currentMb} MB |\n`;
+
+          if (hasBase) {
+            body += `| Base | ${baseMb} MB |\n`;
+            body += `| Delta | ${deltaMb} MB |\n`;
+          } else {
+            body += `| Base | N/A (first build) |\n`;
+          }
+
+          // Try to include Diffuse output
+          const fs = require('fs');
+          try {
+            const diffuse = fs.readFileSync('diffuse-output.txt', 'utf8');
+            if (diffuse.trim()) {
+              body += `\n<details><summary>Diffuse breakdown</summary>\n\n\`\`\`\n${diffuse.slice(0, 4000)}\n\`\`\`\n</details>`;
+            }
+          } catch (e) {}
+
+          // Find and update or create comment
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+          });
+
+          const marker = '## APK Size Report';
+          const existing = comments.find(c => c.body.startsWith(marker));
+
+          if (existing) {
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: existing.id,
+              body: body,
+            });
+          } else {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body,
+            });
+          }

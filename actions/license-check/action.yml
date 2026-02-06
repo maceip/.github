@@ -1,0 +1,22 @@
+name: 'License Check'
+description: 'Checks dependency licenses on PR diff using dependency-review-action'
+
+inputs:
+  allow-licenses:
+    description: 'Comma-separated list of allowed SPDX license identifiers'
+    required: false
+    default: 'MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, MPL-2.0, Unicode-DFS-2016, Unicode-3.0'
+  fail-on-severity:
+    description: 'Fail on vulnerabilities of this severity or higher'
+    required: false
+    default: 'critical'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Dependency Review
+      uses: actions/dependency-review-action@v4
+      with:
+        allow-licenses: ${{ inputs.allow-licenses }}
+        fail-on-severity: ${{ inputs.fail-on-severity }}
+        comment-summary-in-pr: 'on-failure'

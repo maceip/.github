@@ -1,0 +1,207 @@
+name: Vulnerability Response
+
+on:
+  workflow_call:
+    inputs:
+      cvss-threshold:
+        description: 'Minimum CVSS score to flag as critical'
+        type: number
+        default: 9.0
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  scan:
+    name: Scan Dependencies
+    runs-on: ubuntu-latest
+    outputs:
+      vulns: ${{ steps.osv.outputs.vulns }}
+      has_critical: ${{ steps.osv.outputs.has_critical }}
+    steps:
+      - name: Get latest SBOM
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST=$(gh release list --repo "${{ github.repository }}" --limit 1 --json tagName -q '.[0].tagName')
+          if [ -z "$LATEST" ]; then
+            echo "No releases found, skipping scan"
+            echo "has_critical=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh release download "$LATEST" --repo "${{ github.repository }}" --pattern "sbom.json" -D .
+
+      - name: Query OSV for vulnerabilities
+        id: osv
+        run: |
+          if [ ! -f sbom.json ]; then
+            echo "has_critical=false" >> "$GITHUB_OUTPUT"
+            echo "vulns=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          pip install requests -q
+
+          python3 << 'SCAN'
+          import json, requests, os
+
+          sbom = json.load(open('sbom.json'))
+          queries = [{"package": {"purl": c['purl']}} for c in sbom.get('components', []) if c.get('purl')]
+
+          print(f"Scanning {len(queries)} packages...")
+
+          vulns = []
+          cvss_threshold = float(os.environ.get('CVSS_THRESHOLD', '9.0'))
+
+          for i in range(0, len(queries), 1000):
+              resp = requests.post("https://api.osv.dev/v1/querybatch",
+                  json={"queries": queries[i:i+1000]}, timeout=60)
+              if resp.ok:
+                  for idx, r in enumerate(resp.json().get('results', [])):
+                      for v in r.get('vulns', []):
+                          score = 0
+                          for s in v.get('severity', []):
+                              if s.get('type') == 'CVSS_V3':
+                                  score = float(s.get('score', 0))
+
+                          if score >= cvss_threshold:
+                              fixed = None
+                              for aff in v.get('affected', []):
+                                  for rng in aff.get('ranges', []):
+                                      for evt in rng.get('events', []):
+                                          if evt.get('fixed'):
+                                              fixed = evt['fixed']
+
+                              vulns.append({
+                                  'id': v['id'],
+                                  'pkg': queries[i+idx]['package']['purl'],
+                                  'score': score,
+                                  'summary': v.get('summary', '')[:80],
+                                  'fixed': fixed
+                              })
+
+          print(f"Critical vulnerabilities: {len(vulns)}")
+
+          with open('vulns.json', 'w') as f:
+              json.dump(vulns, f)
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"has_critical={'true' if vulns else 'false'}\n")
+              f.write(f"vulns={json.dumps(vulns[:10])}\n")
+          SCAN
+        env:
+          CVSS_THRESHOLD: ${{ inputs.cvss-threshold }}
+
+      - name: Upload scan results
+        uses: actions/upload-artifact@v4
+        with:
+          name: vuln-scan
+          path: vulns.json
+        if: always()
+
+  alert:
+    name: Update Affected Releases
+    needs: scan
+    if: needs.scan.outputs.has_critical == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        vuln: ${{ fromJson(needs.scan.outputs.vulns) }}
+    steps:
+      - name: Update affected releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ID="${{ matrix.vuln.id }}"
+          PKG="${{ matrix.vuln.pkg }}"
+          SCORE="${{ matrix.vuln.score }}"
+          FIXED="${{ matrix.vuln.fixed }}"
+          PKG_SHORT=$(echo "$PKG" | sed 's|pkg:maven/||' | sed 's|@.*||')
+
+          echo "Processing $ID for $PKG_SHORT"
+
+          for TAG in $(gh release list --repo "${{ github.repository }}" --json tagName -q '.[].tagName'); do
+            gh release download "$TAG" --repo "${{ github.repository }}" --pattern "sbom.json" -D /tmp --clobber 2>/dev/null || continue
+
+            if grep -q "${PKG_SHORT##*/}" /tmp/sbom.json; then
+              echo "Release $TAG is affected"
+
+              BODY=$(gh release view "$TAG" --repo "${{ github.repository }}" --json body -q '.body')
+
+              if echo "$BODY" | grep -q "$ID"; then
+                echo "Already has $ID notice"
+                continue
+              fi
+
+              if [ -n "$FIXED" ] && [ "$FIXED" != "null" ]; then
+                BANNER="> **SECURITY** | [$ID](https://osv.dev/vulnerability/$ID) | \`$PKG_SHORT\` | CVSS $SCORE | Fix: \`$FIXED\`"
+              else
+                BANNER="> **SECURITY** | [$ID](https://osv.dev/vulnerability/$ID) | \`$PKG_SHORT\` | CVSS $SCORE | No fix available"
+              fi
+
+              gh release edit "$TAG" --repo "${{ github.repository }}" --notes "${BANNER}
+
+          ${BODY}"
+              echo "Updated $TAG"
+            fi
+          done
+
+  dashboard:
+    name: Update Security Dashboard
+    needs: [scan, alert]
+    if: needs.scan.outputs.has_critical == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update security dashboard issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VULNS='${{ needs.scan.outputs.vulns }}'
+          DATE=$(date -u +"%Y-%m-%d")
+
+          TABLE="| CVE | Package | CVSS | Fix |
+          |-----|---------|------|-----|"
+
+          echo "$VULNS" | jq -r '.[] | "| [\(.id)](https://osv.dev/vulnerability/\(.id)) | \(.pkg | split("/")[-1] | split("@")[0]) | \(.score) | \(.fixed // "none") |"' | while read -r line; do
+            TABLE="$TABLE
+          $line"
+          done
+
+          BODY="## Critical Vulnerabilities
+
+          **Last scan:** $DATE
+          **Action required:** Close this issue only after all CVEs are addressed.
+
+          $TABLE
+
+          ---
+          Releases are **blocked** while this issue is open."
+
+          ISSUE=$(gh issue list --repo "${{ github.repository }}" --label security --state open \
+            --search "Critical Vulnerabilities in:title" --json number -q '.[0].number')
+
+          if [ -n "$ISSUE" ]; then
+            gh issue edit "$ISSUE" --repo "${{ github.repository }}" --body "$BODY"
+            echo "Updated issue #$ISSUE"
+          else
+            gh issue create --repo "${{ github.repository }}" \
+              --title "Critical Vulnerabilities - Action Required" \
+              --body "$BODY" \
+              --label "security"
+          fi
+
+  summary:
+    name: Report
+    needs: [scan]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report
+        run: |
+          echo "## Vulnerability Scan" >> "$GITHUB_STEP_SUMMARY"
+          echo "Critical found: ${{ needs.scan.outputs.has_critical }}" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ needs.scan.outputs.has_critical }}" = "true" ]; then
+            echo "**Releases are blocked until security issues are resolved**" >> "$GITHUB_STEP_SUMMARY"
+          fi

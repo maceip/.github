@@ -1,0 +1,278 @@
+name: Security Scan
+
+on:
+  workflow_call:
+    inputs:
+      severity-threshold:
+        description: 'Comma-separated severity levels to flag'
+        type: string
+        default: 'CRITICAL,HIGH'
+      cvss-threshold:
+        description: 'Minimum CVSS score to flag as critical'
+        type: number
+        default: 9.0
+    outputs:
+      has-critical:
+        description: 'Whether critical vulnerabilities were found'
+        value: ${{ jobs.aggregate.outputs.has_critical }}
+      vuln-count:
+        description: 'Total vulnerabilities found'
+        value: ${{ jobs.aggregate.outputs.vuln_count }}
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  trivy-scan:
+    name: Trivy Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Trivy filesystem scan (SARIF)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: ${{ inputs.severity-threshold }}
+        continue-on-error: true
+
+      - name: Run Trivy filesystem scan (JSON)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'json'
+          output: 'trivy-results.json'
+          severity: ${{ inputs.severity-threshold }}
+        continue-on-error: true
+
+      - name: Upload Trivy SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy
+        continue-on-error: true
+
+      - name: Upload Trivy artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-results
+          path: |
+            trivy-results.sarif
+            trivy-results.json
+
+  osv-scan:
+    name: OSV-Scanner
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install OSV-Scanner
+        run: |
+          curl -fsSL https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64 \
+            -o /usr/local/bin/osv-scanner 2>/dev/null || true
+          chmod +x /usr/local/bin/osv-scanner 2>/dev/null || true
+
+      - name: Run OSV-Scanner
+        run: |
+          if command -v osv-scanner &>/dev/null; then
+            osv-scanner --format json --output osv-results.json . 2>/dev/null || true
+          else
+            echo '{"results":[]}' > osv-results.json
+          fi
+        continue-on-error: true
+
+      - name: Upload OSV results
+        uses: actions/upload-artifact@v4
+        with:
+          name: osv-results
+          path: osv-results.json
+
+  grype-scan:
+    name: Grype Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Grype scan
+        uses: anchore/scan-action@v5
+        id: grype
+        with:
+          path: '.'
+          output-format: 'sarif'
+          severity-cutoff: 'high'
+          fail-build: 'false'
+        continue-on-error: true
+
+      - name: Upload Grype SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ steps.grype.outputs.sarif }}
+          category: grype
+        continue-on-error: true
+
+      - name: Upload Grype results
+        uses: actions/upload-artifact@v4
+        with:
+          name: grype-results
+          path: ${{ steps.grype.outputs.sarif }}
+        if: always()
+
+  aggregate:
+    name: Aggregate Results
+    needs: [trivy-scan, osv-scan, grype-scan]
+    if: always()
+    runs-on: ubuntu-latest
+    outputs:
+      has_critical: ${{ steps.summarize.outputs.has_critical }}
+      vuln_count: ${{ steps.summarize.outputs.vuln_count }}
+    steps:
+      - name: Download all scan results
+        uses: actions/download-artifact@v4
+        with:
+          path: scan-results
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install matplotlib
+        run: pip install matplotlib
+
+      - name: Summarize and chart
+        id: summarize
+        run: |
+          python3 << 'AGGREGATE'
+          import json
+          import os
+          import glob
+          import matplotlib.pyplot as plt
+
+          plt.style.use('dark_background')
+
+          trivy_vulns = 0
+          osv_vulns = 0
+          grype_vulns = 0
+          critical_count = 0
+
+          # Parse Trivy JSON
+          for f in glob.glob('scan-results/trivy-results/trivy-results.json'):
+              try:
+                  data = json.load(open(f))
+                  for result in data.get('Results', []):
+                      for vuln in result.get('Vulnerabilities', []):
+                          trivy_vulns += 1
+                          for provider in vuln.get('CVSS', {}).values():
+                              if provider.get('V3Score', 0) >= ${{ inputs.cvss-threshold }}:
+                                  critical_count += 1
+                                  break
+              except Exception:
+                  pass
+
+          # Parse OSV JSON
+          for f in glob.glob('scan-results/osv-results/osv-results.json'):
+              try:
+                  data = json.load(open(f))
+                  for result in data.get('results', []):
+                      osv_vulns += len(result.get('packages', []))
+              except Exception:
+                  pass
+
+          # Parse Grype SARIF
+          for f in glob.glob('scan-results/grype-results/*.sarif'):
+              try:
+                  data = json.load(open(f))
+                  for run in data.get('runs', []):
+                      grype_vulns += len(run.get('results', []))
+              except Exception:
+                  pass
+
+          total = trivy_vulns + osv_vulns + grype_vulns
+          has_critical = 'true' if critical_count > 0 else 'false'
+
+          # Generate summary chart
+          fig, ax = plt.subplots(figsize=(8, 5), facecolor='#0d1117')
+          ax.set_facecolor('#161b22')
+
+          scanners = ['Trivy', 'OSV-Scanner', 'Grype']
+          counts = [trivy_vulns, osv_vulns, grype_vulns]
+          colors = ['#58a6ff', '#3fb950', '#a371f7']
+
+          bars = ax.bar(scanners, counts, color=colors, edgecolor='#0d1117', linewidth=2)
+          for bar, count in zip(bars, counts):
+              ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+                     str(count), ha='center', color='#c9d1d9', fontweight='bold')
+
+          ax.set_title(f'Vulnerability Scan Results (Critical: {critical_count})',
+                      color='#c9d1d9', fontsize=14, pad=15)
+          ax.set_ylabel('Findings', color='#c9d1d9')
+          ax.tick_params(colors='#c9d1d9')
+          for spine in ax.spines.values():
+              spine.set_color('#30363d')
+
+          plt.tight_layout()
+          plt.savefig('vuln-summary-chart.png', dpi=150, facecolor='#0d1117',
+                     edgecolor='none', bbox_inches='tight')
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f'has_critical={has_critical}\n')
+              f.write(f'vuln_count={total}\n')
+
+          # Step summary
+          summary = f"""## Security Scan Results
+
+          | Scanner | Findings |
+          |---------|----------|
+          | Trivy | {trivy_vulns} |
+          | OSV-Scanner | {osv_vulns} |
+          | Grype | {grype_vulns} |
+          | **Total** | **{total}** |
+          | **Critical (CVSS >= ${{ inputs.cvss-threshold }})** | **{critical_count}** |
+          """
+
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write(summary)
+
+          AGGREGATE
+
+      - name: Upload summary chart
+        uses: actions/upload-artifact@v4
+        with:
+          name: vuln-summary-chart
+          path: vuln-summary-chart.png
+
+      - name: Create tracking issue for critical CVEs
+        if: steps.summarize.outputs.has_critical == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          EXISTING=$(gh issue list --repo "${{ github.repository }}" --label security --state open \
+            --search "Security Scan: Critical Vulnerabilities in:title" --json number -q '.[0].number' 2>/dev/null || true)
+
+          BODY="## Critical Vulnerabilities Detected
+
+          **Scan date:** $(date -u +%Y-%m-%d)
+          **Total findings:** ${{ steps.summarize.outputs.vuln_count }}
+          **Repository:** ${{ github.repository }}
+
+          Review the scan artifacts for full details.
+
+          ---
+          Releases are **blocked** while this issue is open."
+
+          if [ -n "$EXISTING" ]; then
+            gh issue edit "$EXISTING" --repo "${{ github.repository }}" --body "$BODY"
+          else
+            gh issue create --repo "${{ github.repository }}" \
+              --title "Security Scan: Critical Vulnerabilities" \
+              --body "$BODY" \
+              --label "security"
+          fi

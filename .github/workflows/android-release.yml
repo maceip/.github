@@ -1,0 +1,243 @@
+name: Android Release
+
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        type: string
+        default: '21'
+      ndk-version:
+        type: string
+        default: ''
+      app-module:
+        type: string
+        default: 'app'
+      app-name:
+        description: 'Application name for SBOM and release'
+        type: string
+        required: true
+      submodules:
+        type: boolean
+        default: false
+      lfs:
+        type: boolean
+        default: false
+      extra-setup-script:
+        type: string
+        default: ''
+      working-directory:
+        type: string
+        default: '.'
+      gradle-task:
+        type: string
+        default: 'assembleDebug'
+      test-task:
+        type: string
+        default: 'testDebugUnitTest'
+      screenshot-task:
+        type: string
+        default: ''
+      expected-native-libs:
+        type: string
+        default: ''
+      min-apk-size:
+        type: number
+        default: 0
+      check-alignment:
+        type: boolean
+        default: false
+    secrets:
+      KEYSTORE_BASE64:
+        required: false
+      KEYSTORE_PASSWORD:
+        required: false
+      KEY_ALIAS:
+        required: false
+      KEY_PASSWORD:
+        required: false
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+  issues: read
+
+jobs:
+  security-gate:
+    name: Security Gate
+    runs-on: ubuntu-latest
+    outputs:
+      blocked: ${{ steps.check.outputs.blocked }}
+    steps:
+      - name: Check for open critical CVEs
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          COUNT=$(gh issue list --repo "${{ github.repository }}" --label security --state open --json number -q 'length')
+          if [ "$COUNT" -gt 0 ]; then
+            echo "::error::Release blocked: $COUNT open security issue(s)"
+            echo "blocked=true" >> "$GITHUB_OUTPUT"
+            gh issue list --repo "${{ github.repository }}" --label security --state open
+            exit 1
+          fi
+          echo "blocked=false" >> "$GITHUB_OUTPUT"
+
+  build-and-release:
+    name: Build & Release
+    needs: security-gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: ${{ inputs.submodules && 'recursive' || 'false' }}
+          lfs: ${{ inputs.lfs }}
+
+      - name: Gradle Setup
+        uses: ./.github/actions/gradle-setup
+        with:
+          java-version: ${{ inputs.java-version }}
+          ndk-version: ${{ inputs.ndk-version }}
+
+      - name: Extra setup
+        if: inputs.extra-setup-script != ''
+        shell: bash
+        run: ${{ inputs.extra-setup-script }}
+
+      - name: Decode signing keystore
+        if: secrets.KEYSTORE_BASE64 != ''
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > keystore.jks
+          echo "KEYSTORE_FILE=$(pwd)/keystore.jks" >> "$GITHUB_ENV"
+          echo "KEYSTORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }}" >> "$GITHUB_ENV"
+          echo "KEY_ALIAS=${{ secrets.KEY_ALIAS }}" >> "$GITHUB_ENV"
+          echo "KEY_PASSWORD=${{ secrets.KEY_PASSWORD }}" >> "$GITHUB_ENV"
+
+      - name: Build APK
+        working-directory: ${{ inputs.working-directory }}
+        run: ./gradlew ${{ inputs.gradle-task }} --no-daemon
+
+      - name: Run unit tests
+        working-directory: ${{ inputs.working-directory }}
+        run: ./gradlew ${{ inputs.test-task }} --no-daemon
+
+      - name: Run screenshot verification
+        if: inputs.screenshot-task != ''
+        working-directory: ${{ inputs.working-directory }}
+        run: ./gradlew ${{ inputs.screenshot-task }} --no-daemon
+
+      - name: Find APK
+        id: find-apk
+        shell: bash
+        run: |
+          APK_PATH=$(find "${{ inputs.app-module }}/build/outputs/apk" -name "*.apk" | head -1)
+          if [ -z "$APK_PATH" ]; then
+            echo "::error::No APK found"
+            exit 1
+          fi
+          echo "apk_path=$APK_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Verify APK
+        uses: ./.github/actions/apk-verify
+        with:
+          apk-path: ${{ steps.find-apk.outputs.apk_path }}
+          expected-native-libs: ${{ inputs.expected-native-libs }}
+          min-size-bytes: ${{ inputs.min-apk-size }}
+          check-alignment: ${{ inputs.check-alignment }}
+
+      - name: Generate SBOM
+        uses: ./.github/actions/sbom-generate
+        with:
+          app-module: ${{ inputs.app-module }}
+          app-name: ${{ inputs.app-name }}
+          app-version: ${{ steps.version.outputs.new_version || '0.0.0' }}
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: Get next version
+        id: version
+        run: |
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          VERSION=${LATEST_TAG#v}
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+          PATCH=$((PATCH + 1))
+          if [ "$PATCH" -ge 100 ]; then PATCH=0; MINOR=$((MINOR + 1)); fi
+          if [ "$MINOR" -ge 100 ]; then MINOR=0; MAJOR=$((MAJOR + 1)); fi
+          echo "new_version=v${MAJOR}.${MINOR}.${PATCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Rename APK for release
+        id: release-apk
+        run: |
+          APK_NAME="${{ inputs.app-name }}-${{ steps.version.outputs.new_version }}-debug.apk"
+          cp "${{ steps.find-apk.outputs.apk_path }}" "$APK_NAME"
+          echo "apk_path=$APK_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Generate artifact attestations
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            ${{ steps.release-apk.outputs.apk_path }}
+            sbom.json
+            staleness-report.json
+            update-cadence-graph.png
+
+      - name: Generate release body
+        id: release-body
+        run: |
+          python3 << 'PYSCRIPT'
+          import json
+
+          d = json.load(open('staleness-report.json'))
+          s = d['summary']
+          total = s['total']
+          health = int(s['up_to_date'] / max(total, 1) * 100)
+
+          def sparkbar(val, max_val, width=20):
+              filled = int((val / max(max_val, 1)) * width)
+              return '\u2588' * filled + '\u2591' * (width - filled)
+
+          body = f"""### ${{ steps.version.outputs.new_version }}
+
+          \`${{ github.sha }}\`
+
+          ---
+
+          **Dependencies** {total} | **Health** {health}%
+
+          ```
+          Up to date   {sparkbar(s['up_to_date'], total)} {s['up_to_date']}
+          Slight lag   {sparkbar(s['slightly_outdated'], total)} {s['slightly_outdated']}
+          Outdated     {sparkbar(s['outdated'], total)} {s['outdated']}
+          Critical     {sparkbar(s['very_outdated'], total)} {s['very_outdated']}
+          Unknown      {sparkbar(s['unknown'], total)} {s['unknown']}
+          ```
+
+          ![staleness](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.new_version }}/update-cadence-graph.png)
+          """
+
+          with open('release-body.md', 'w') as f:
+              f.write(body)
+          PYSCRIPT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.new_version }}
+          name: Release ${{ steps.version.outputs.new_version }}
+          body_path: release-body.md
+          files: |
+            ${{ steps.release-apk.outputs.apk_path }}
+            sbom.json
+            staleness-report.json
+            sbom-summary.md
+            update-cadence-graph.png
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Summary
+        run: |
+          echo "## Release Complete" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Version:** ${{ steps.version.outputs.new_version }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Artifacts:** APK, SBOM, Staleness Report, Update Graph" >> "$GITHUB_STEP_SUMMARY"

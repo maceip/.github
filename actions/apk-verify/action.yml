@@ -1,0 +1,112 @@
+name: 'APK Verify'
+description: 'Verifies APK contents: classes.dex, native libs, size bounds, 16KB page alignment'
+
+inputs:
+  apk-path:
+    description: 'Path to the APK file'
+    required: true
+  expected-native-libs:
+    description: 'Comma-separated list of expected native .so files (e.g. lib/arm64-v8a/libc2w_wamr.so)'
+    required: false
+    default: ''
+  min-size-bytes:
+    description: 'Minimum APK size in bytes (0 to skip)'
+    required: false
+    default: '0'
+  max-size-bytes:
+    description: 'Maximum APK size in bytes (0 to skip)'
+    required: false
+    default: '0'
+  check-alignment:
+    description: 'Check 16KB page alignment on ARM64 .so files'
+    required: false
+    default: 'false'
+
+outputs:
+  apk-size:
+    description: 'APK size in bytes'
+    value: ${{ steps.verify.outputs.apk_size }}
+  apk-size-mb:
+    description: 'APK size in MB'
+    value: ${{ steps.verify.outputs.apk_size_mb }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Verify APK contents
+      id: verify
+      shell: bash
+      run: |
+        APK="${{ inputs.apk-path }}"
+
+        if [ ! -f "$APK" ]; then
+          echo "::error::APK not found at $APK"
+          exit 1
+        fi
+
+        echo "=== APK contents ==="
+        unzip -l "$APK" | grep -E '\.so|\.dex|\.wasm|\.aot|classes' | head -30
+
+        # Check classes.dex
+        if ! unzip -l "$APK" | grep -q 'classes.dex'; then
+          echo "::error::APK missing classes.dex"
+          exit 1
+        fi
+        echo "OK: classes.dex present"
+
+        # Check expected native libs
+        if [ -n "${{ inputs.expected-native-libs }}" ]; then
+          IFS=',' read -ra LIBS <<< "${{ inputs.expected-native-libs }}"
+          for lib in "${LIBS[@]}"; do
+            lib=$(echo "$lib" | xargs)
+            if ! unzip -l "$APK" | grep -q "$lib"; then
+              echo "::error::APK missing expected native library: $lib"
+              exit 1
+            fi
+            echo "OK: $lib present"
+          done
+        fi
+
+        # Check APK size
+        APK_SIZE=$(stat -c%s "$APK")
+        APK_SIZE_MB=$((APK_SIZE / 1024 / 1024))
+        echo "APK size: ${APK_SIZE_MB} MB ($APK_SIZE bytes)"
+        echo "apk_size=$APK_SIZE" >> "$GITHUB_OUTPUT"
+        echo "apk_size_mb=$APK_SIZE_MB" >> "$GITHUB_OUTPUT"
+
+        MIN=${{ inputs.min-size-bytes }}
+        MAX=${{ inputs.max-size-bytes }}
+
+        if [ "$MIN" -gt 0 ] && [ "$APK_SIZE" -lt "$MIN" ]; then
+          echo "::error::APK too small: $APK_SIZE bytes (minimum: $MIN)"
+          exit 1
+        fi
+
+        if [ "$MAX" -gt 0 ] && [ "$APK_SIZE" -gt "$MAX" ]; then
+          echo "::error::APK too large: $APK_SIZE bytes (maximum: $MAX)"
+          exit 1
+        fi
+
+        # Check 16KB page alignment on ARM64 .so files
+        if [ "${{ inputs.check-alignment }}" = "true" ]; then
+          echo ""
+          echo "=== Checking 16KB ELF alignment ==="
+          TMPDIR=$(mktemp -d)
+          unzip -q -o "$APK" 'lib/arm64-v8a/*.so' -d "$TMPDIR" 2>/dev/null || true
+
+          if [ -d "$TMPDIR/lib/arm64-v8a" ]; then
+            for so in "$TMPDIR"/lib/arm64-v8a/*.so; do
+              NAME=$(basename "$so")
+              ALIGNMENT=$(readelf -l "$so" 2>/dev/null | grep "LOAD" | head -1 | awk '{print $NF}')
+              if [ -n "$ALIGNMENT" ] && [ "$ALIGNMENT" != "0x4000" ]; then
+                echo "::warning::$NAME LOAD segment alignment is $ALIGNMENT (expected 0x4000 for 16KB pages)"
+              else
+                echo "OK: $NAME has correct alignment ($ALIGNMENT)"
+              fi
+            done
+          fi
+          rm -rf "$TMPDIR"
+        fi
+
+        echo ""
+        echo "=== All APK verification checks passed ==="

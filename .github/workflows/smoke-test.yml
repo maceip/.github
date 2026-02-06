@@ -1,0 +1,130 @@
+name: Smoke Test
+
+on:
+  workflow_call:
+    inputs:
+      apk-artifact-name:
+        description: 'Name of the artifact containing the APK to test'
+        type: string
+        required: true
+      package-name:
+        description: 'Android package name (e.g. dev.hydra.presssecretary)'
+        type: string
+        required: true
+      main-activity:
+        description: 'Main activity class (e.g. .MainActivity)'
+        type: string
+        default: '.MainActivity'
+      wait-seconds:
+        description: 'Seconds to wait after launch before checking'
+        type: number
+        default: 15
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Launch Test
+    runs-on: self-hosted
+    concurrency:
+      group: emulator
+      cancel-in-progress: false
+
+    steps:
+      - name: Download APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.apk-artifact-name }}
+          path: smoke-apk
+
+      - name: Find APK
+        id: find-apk
+        run: |
+          APK_PATH=$(find smoke-apk -name "*.apk" | head -1)
+          if [ -z "$APK_PATH" ]; then
+            echo "::error::No APK found in artifact"
+            exit 1
+          fi
+          echo "apk_path=$APK_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for emulator
+        run: |
+          echo "Waiting for emulator to be ready..."
+          adb wait-for-device
+          TIMEOUT=120
+          ELAPSED=0
+          while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" != "1" ]; do
+            if [ $ELAPSED -ge $TIMEOUT ]; then
+              echo "::error::Emulator boot timeout after ${TIMEOUT}s"
+              exit 1
+            fi
+            sleep 2
+            ELAPSED=$((ELAPSED + 2))
+          done
+          echo "Emulator is ready"
+
+      - name: Install APK
+        run: |
+          echo "=== Installing APK ==="
+          adb install -r "${{ steps.find-apk.outputs.apk_path }}"
+
+      - name: Clean app state
+        run: |
+          adb shell am force-stop "${{ inputs.package-name }}"
+          adb shell pm clear "${{ inputs.package-name }}" 2>/dev/null || true
+
+      - name: Clear logcat
+        run: adb logcat -c
+
+      - name: Launch app
+        run: |
+          echo "=== Launching ${{ inputs.package-name }}/${{ inputs.main-activity }} ==="
+          adb shell am start -n "${{ inputs.package-name }}/${{ inputs.main-activity }}"
+
+      - name: Wait for initialization
+        run: sleep ${{ inputs.wait-seconds }}
+
+      - name: Check for fatal exceptions
+        id: crash-check
+        run: |
+          CRASH_LOG=$(adb shell logcat -d -s AndroidRuntime:E)
+
+          if echo "$CRASH_LOG" | grep -q "FATAL EXCEPTION"; then
+            echo "::error::App crashed on launch!"
+            echo ""
+            echo "=== CRASH LOG ==="
+            echo "$CRASH_LOG"
+            echo "crashed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No fatal exceptions detected"
+            echo "crashed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify activity is running
+        id: activity-check
+        run: |
+          ACTIVITY_STATUS=$(adb shell dumpsys activity activities 2>/dev/null | grep "${{ inputs.package-name }}" || true)
+
+          if [ -z "$ACTIVITY_STATUS" ]; then
+            echo "::error::Activity is no longer running"
+            echo "running=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Activity is still running"
+            echo "running=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          adb shell am force-stop "${{ inputs.package-name }}" 2>/dev/null || true
+          adb uninstall "${{ inputs.package-name }}" 2>/dev/null || true
+
+      - name: Evaluate result
+        run: |
+          if [ "${{ steps.crash-check.outputs.crashed }}" = "true" ] || \
+             [ "${{ steps.activity-check.outputs.running }}" = "false" ]; then
+            echo "::error::Smoke test FAILED"
+            exit 1
+          fi
+          echo "Smoke test PASSED"

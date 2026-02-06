@@ -1,0 +1,148 @@
+name: 'Security Multi-Scan'
+description: 'Orchestrates Trivy + OSV-Scanner + Grype, aggregates results, filters by CVSS threshold'
+
+inputs:
+  severity-threshold:
+    description: 'Comma-separated severity levels to flag (e.g. CRITICAL,HIGH)'
+    required: false
+    default: 'CRITICAL,HIGH'
+  cvss-threshold:
+    description: 'Minimum CVSS score to flag as critical'
+    required: false
+    default: '9.0'
+  scan-path:
+    description: 'Path to scan'
+    required: false
+    default: '.'
+
+outputs:
+  has-critical:
+    description: 'Whether critical vulnerabilities were found'
+    value: ${{ steps.aggregate.outputs.has_critical }}
+  vuln-count:
+    description: 'Total number of vulnerabilities found'
+    value: ${{ steps.aggregate.outputs.vuln_count }}
+  critical-count:
+    description: 'Number of critical vulnerabilities'
+    value: ${{ steps.aggregate.outputs.critical_count }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Run Trivy filesystem scan
+      uses: aquasecurity/trivy-action@0.28.0
+      with:
+        scan-type: 'fs'
+        scan-ref: ${{ inputs.scan-path }}
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        severity: ${{ inputs.severity-threshold }}
+      continue-on-error: true
+
+    - name: Run Trivy JSON scan
+      uses: aquasecurity/trivy-action@0.28.0
+      with:
+        scan-type: 'fs'
+        scan-ref: ${{ inputs.scan-path }}
+        format: 'json'
+        output: 'trivy-results.json'
+        severity: ${{ inputs.severity-threshold }}
+      continue-on-error: true
+
+    - name: Run Grype scan
+      uses: anchore/scan-action@v5
+      id: grype
+      with:
+        path: ${{ inputs.scan-path }}
+        output-format: 'sarif'
+        severity-cutoff: 'high'
+        fail-build: 'false'
+      continue-on-error: true
+
+    - name: Copy Grype results
+      shell: bash
+      run: |
+        if [ -f "${{ steps.grype.outputs.sarif }}" ]; then
+          cp "${{ steps.grype.outputs.sarif }}" grype-results.sarif
+        else
+          echo '{"runs":[]}' > grype-results.sarif
+        fi
+
+    - name: Run OSV-Scanner
+      shell: bash
+      run: |
+        # Install osv-scanner
+        curl -fsSL https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64 \
+          -o /usr/local/bin/osv-scanner 2>/dev/null || true
+        chmod +x /usr/local/bin/osv-scanner 2>/dev/null || true
+
+        if command -v osv-scanner &>/dev/null; then
+          osv-scanner --format json --output osv-results.json "${{ inputs.scan-path }}" 2>/dev/null || true
+        else
+          echo '{"results":[]}' > osv-results.json
+        fi
+      continue-on-error: true
+
+    - name: Aggregate results
+      id: aggregate
+      shell: bash
+      run: |
+        VULN_COUNT=0
+        CRITICAL_COUNT=0
+
+        # Count Trivy vulns
+        if [ -f trivy-results.json ]; then
+          TRIVY_COUNT=$(python3 -c "
+        import json
+        data = json.load(open('trivy-results.json'))
+        count = 0
+        critical = 0
+        for result in data.get('Results', []):
+            for vuln in result.get('Vulnerabilities', []):
+                count += 1
+                score = vuln.get('CVSS', {})
+                for provider in score.values():
+                    if provider.get('V3Score', 0) >= ${{ inputs.cvss-threshold }}:
+                        critical += 1
+                        break
+        print(f'{count},{critical}')
+        " 2>/dev/null || echo "0,0")
+          VULN_COUNT=$((VULN_COUNT + $(echo "$TRIVY_COUNT" | cut -d, -f1)))
+          CRITICAL_COUNT=$((CRITICAL_COUNT + $(echo "$TRIVY_COUNT" | cut -d, -f2)))
+        fi
+
+        # Count OSV vulns
+        if [ -f osv-results.json ]; then
+          OSV_COUNT=$(python3 -c "
+        import json
+        data = json.load(open('osv-results.json'))
+        count = 0
+        for result in data.get('results', []):
+            count += len(result.get('packages', []))
+        print(count)
+        " 2>/dev/null || echo "0")
+          VULN_COUNT=$((VULN_COUNT + OSV_COUNT))
+        fi
+
+        echo "Total vulnerabilities: $VULN_COUNT"
+        echo "Critical (CVSS >= ${{ inputs.cvss-threshold }}): $CRITICAL_COUNT"
+
+        HAS_CRITICAL="false"
+        if [ "$CRITICAL_COUNT" -gt 0 ]; then
+          HAS_CRITICAL="true"
+        fi
+
+        echo "has_critical=$HAS_CRITICAL" >> "$GITHUB_OUTPUT"
+        echo "vuln_count=$VULN_COUNT" >> "$GITHUB_OUTPUT"
+        echo "critical_count=$CRITICAL_COUNT" >> "$GITHUB_OUTPUT"
+
+    - name: Upload scan artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: security-scan-results
+        path: |
+          trivy-results.sarif
+          trivy-results.json
+          grype-results.sarif
+          osv-results.json
+      if: always()

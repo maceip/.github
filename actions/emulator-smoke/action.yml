@@ -1,0 +1,104 @@
+name: 'Emulator Smoke Test'
+description: 'Install APK on persistent emulator, launch, check for crash'
+
+inputs:
+  apk-path:
+    description: 'Path to the APK to install'
+    required: true
+  package-name:
+    description: 'Android package name (e.g. dev.hydra.presssecretary)'
+    required: true
+  main-activity:
+    description: 'Main activity class (e.g. .MainActivity)'
+    required: false
+    default: '.MainActivity'
+  wait-seconds:
+    description: 'Seconds to wait after launch before checking for crash'
+    required: false
+    default: '15'
+
+outputs:
+  result:
+    description: 'pass or fail'
+    value: ${{ steps.smoke.outputs.result }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Wait for emulator
+      shell: bash
+      run: |
+        echo "Waiting for emulator to be ready..."
+        adb wait-for-device
+        # Wait for boot to complete
+        TIMEOUT=120
+        ELAPSED=0
+        while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" != "1" ]; do
+          if [ $ELAPSED -ge $TIMEOUT ]; then
+            echo "::error::Emulator boot timeout after ${TIMEOUT}s"
+            exit 1
+          fi
+          sleep 2
+          ELAPSED=$((ELAPSED + 2))
+        done
+        echo "Emulator is ready"
+
+    - name: Install and launch APK
+      id: smoke
+      shell: bash
+      run: |
+        PACKAGE="${{ inputs.package-name }}"
+        ACTIVITY="${{ inputs.main-activity }}"
+        APK="${{ inputs.apk-path }}"
+        WAIT=${{ inputs.wait-seconds }}
+
+        echo "=== Installing APK ==="
+        adb install -r "$APK"
+
+        echo "=== Clearing previous state ==="
+        adb shell am force-stop "$PACKAGE"
+        adb shell pm clear "$PACKAGE" 2>/dev/null || true
+
+        echo "=== Clearing logcat ==="
+        adb logcat -c
+
+        echo "=== Launching ${PACKAGE}/${ACTIVITY} ==="
+        adb shell am start -n "${PACKAGE}/${ACTIVITY}"
+
+        echo "=== Waiting ${WAIT}s for app to initialize ==="
+        sleep "$WAIT"
+
+        echo "=== Checking for fatal exceptions ==="
+        CRASH_LOG=$(adb shell logcat -d -s AndroidRuntime:E)
+
+        echo "=== Checking if activity is still running ==="
+        ACTIVITY_STATUS=$(adb shell dumpsys activity activities 2>/dev/null | grep "$PACKAGE" || true)
+
+        RESULT="pass"
+
+        if echo "$CRASH_LOG" | grep -q "FATAL EXCEPTION"; then
+          echo "::error::App crashed on launch!"
+          echo ""
+          echo "=== CRASH LOG ==="
+          echo "$CRASH_LOG"
+          RESULT="fail"
+        fi
+
+        if [ -z "$ACTIVITY_STATUS" ]; then
+          echo "::error::Activity is no longer running"
+          RESULT="fail"
+        else
+          echo "Activity is running"
+        fi
+
+        echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+
+        echo "=== Cleaning up ==="
+        adb shell am force-stop "$PACKAGE"
+        adb uninstall "$PACKAGE" 2>/dev/null || true
+
+        if [ "$RESULT" = "fail" ]; then
+          exit 1
+        fi
+
+        echo "=== Smoke test passed ==="

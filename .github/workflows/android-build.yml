@@ -1,0 +1,202 @@
+name: Android Build
+
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        description: 'JDK version'
+        type: string
+        default: '21'
+      ndk-version:
+        description: 'Android NDK version (empty to skip)'
+        type: string
+        default: ''
+      gradle-task:
+        description: 'Gradle build task'
+        type: string
+        default: 'assembleDebug'
+      lint-task:
+        description: 'Gradle lint task'
+        type: string
+        default: 'lint'
+      test-task:
+        description: 'Gradle unit test task'
+        type: string
+        default: 'testDebugUnitTest'
+      app-module:
+        description: 'Application module path (e.g. app, android-app-wamr/app)'
+        type: string
+        default: 'app'
+      submodules:
+        description: 'Checkout submodules recursively'
+        type: boolean
+        default: false
+      lfs:
+        description: 'Checkout with Git LFS'
+        type: boolean
+        default: false
+      extra-setup-script:
+        description: 'Extra setup commands to run before build (e.g. asset downloads)'
+        type: string
+        default: ''
+      expected-native-libs:
+        description: 'Comma-separated expected native libs in APK'
+        type: string
+        default: ''
+      min-apk-size:
+        description: 'Minimum APK size in bytes (0 to skip)'
+        type: number
+        default: 0
+      check-alignment:
+        description: 'Check 16KB page alignment on ARM64 .so files'
+        type: boolean
+        default: false
+      working-directory:
+        description: 'Working directory for Gradle commands (if gradlew is not at repo root)'
+        type: string
+        default: '.'
+      detekt-config-repo:
+        description: 'Repository containing shared detekt config (owner/repo)'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: ${{ inputs.submodules && 'recursive' || 'false' }}
+          lfs: ${{ inputs.lfs }}
+
+      - name: Gradle Setup
+        uses: ./.github/actions/gradle-setup
+        with:
+          java-version: ${{ inputs.java-version }}
+          ndk-version: ${{ inputs.ndk-version }}
+
+      - name: Download shared detekt config
+        if: inputs.detekt-config-repo != ''
+        shell: bash
+        run: |
+          mkdir -p config
+          curl -fsSL "https://raw.githubusercontent.com/${{ inputs.detekt-config-repo }}/main/configs/detekt.yml" \
+            -o config/detekt.yml
+          echo "Downloaded shared detekt config"
+
+      - name: Extra setup
+        if: inputs.extra-setup-script != ''
+        shell: bash
+        run: ${{ inputs.extra-setup-script }}
+
+      - name: Run Android Lint
+        working-directory: ${{ inputs.working-directory }}
+        run: ./gradlew ${{ inputs.lint-task }} --no-daemon
+
+      - name: Upload lint results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-results
+          path: |
+            **/build/reports/lint-results*.html
+            **/build/reports/lint-results*.xml
+            **/build/reports/lint-results*.sarif
+
+      - name: Upload SARIF to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: .
+          category: android-lint
+        continue-on-error: true
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: ${{ inputs.submodules && 'recursive' || 'false' }}
+          lfs: ${{ inputs.lfs }}
+
+      - name: Gradle Setup
+        uses: ./.github/actions/gradle-setup
+        with:
+          java-version: ${{ inputs.java-version }}
+          ndk-version: ${{ inputs.ndk-version }}
+
+      - name: Extra setup
+        if: inputs.extra-setup-script != ''
+        shell: bash
+        run: ${{ inputs.extra-setup-script }}
+
+      - name: Build APK
+        working-directory: ${{ inputs.working-directory }}
+        run: ./gradlew ${{ inputs.gradle-task }} --no-daemon
+
+      - name: Find APK
+        id: find-apk
+        shell: bash
+        run: |
+          APK_PATH=$(find "${{ inputs.app-module }}/build/outputs/apk" -name "*.apk" | head -1)
+          if [ -z "$APK_PATH" ]; then
+            echo "::error::No APK found in ${{ inputs.app-module }}/build/outputs/apk"
+            exit 1
+          fi
+          echo "apk_path=$APK_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Verify APK
+        uses: ./.github/actions/apk-verify
+        with:
+          apk-path: ${{ steps.find-apk.outputs.apk_path }}
+          expected-native-libs: ${{ inputs.expected-native-libs }}
+          min-size-bytes: ${{ inputs.min-apk-size }}
+          check-alignment: ${{ inputs.check-alignment }}
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-apk
+          path: ${{ steps.find-apk.outputs.apk_path }}
+
+  unit-test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: ${{ inputs.submodules && 'recursive' || 'false' }}
+          lfs: ${{ inputs.lfs }}
+
+      - name: Gradle Setup
+        uses: ./.github/actions/gradle-setup
+        with:
+          java-version: ${{ inputs.java-version }}
+          ndk-version: ${{ inputs.ndk-version }}
+
+      - name: Extra setup
+        if: inputs.extra-setup-script != ''
+        shell: bash
+        run: ${{ inputs.extra-setup-script }}
+
+      - name: Run unit tests
+        working-directory: ${{ inputs.working-directory }}
+        run: ./gradlew ${{ inputs.test-task }} --no-daemon
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-results
+          path: |
+            **/build/reports/tests/
+            **/build/test-results/

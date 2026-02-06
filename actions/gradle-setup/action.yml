@@ -1,0 +1,45 @@
+name: 'Gradle Setup'
+description: 'Sets up JDK, Android SDK, optional NDK, and Gradle caching'
+
+inputs:
+  java-version:
+    description: 'JDK version to install'
+    required: false
+    default: '21'
+  ndk-version:
+    description: 'Android NDK version (e.g. 27.2.12479018). Skipped if empty.'
+    required: false
+    default: ''
+  gradle-cache:
+    description: 'Enable Gradle dependency caching'
+    required: false
+    default: 'true'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up JDK ${{ inputs.java-version }}
+      uses: actions/setup-java@v4
+      with:
+        java-version: ${{ inputs.java-version }}
+        distribution: 'temurin'
+        cache: gradle
+
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v3
+
+    - name: Install NDK ${{ inputs.ndk-version }}
+      if: inputs.ndk-version != ''
+      shell: bash
+      run: sdkmanager --install "ndk;${{ inputs.ndk-version }}"
+
+    - name: Cache Gradle packages
+      if: inputs.gradle-cache == 'true'
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.gradle/caches
+          ~/.gradle/wrapper
+        key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+        restore-keys: |
+          ${{ runner.os }}-gradle-

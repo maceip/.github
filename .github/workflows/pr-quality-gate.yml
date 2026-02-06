@@ -1,0 +1,350 @@
+name: PR Quality Gate
+
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        type: string
+        default: '21'
+      ndk-version:
+        type: string
+        default: ''
+      gradle-task:
+        type: string
+        default: 'assembleDebug'
+      lint-task:
+        type: string
+        default: 'lint'
+      test-task:
+        type: string
+        default: 'testDebugUnitTest'
+      app-module:
+        type: string
+        default: 'app'
+      submodules:
+        type: boolean
+        default: false
+      lfs:
+        type: boolean
+        default: false
+      extra-setup-script:
+        type: string
+        default: ''
+      working-directory:
+        type: string
+        default: '.'
+      screenshot-task:
+        description: 'Gradle screenshot verify task (empty to skip)'
+        type: string
+        default: ''
+      has-instrumentation-tests:
+        description: 'Run instrumentation tests on self-hosted emulator'
+        type: boolean
+        default: false
+      package-name:
+        description: 'Android package name for smoke test'
+        type: string
+        default: ''
+      main-activity:
+        description: 'Main activity for smoke test'
+        type: string
+        default: '.MainActivity'
+      expected-native-libs:
+        type: string
+        default: ''
+      min-apk-size:
+        type: number
+        default: 0
+      check-alignment:
+        type: boolean
+        default: false
+      detekt-config-repo:
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: write
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: ${{ inputs.submodules && 'recursive' || 'false' }}
+          lfs: ${{ inputs.lfs }}
+
+      - name: Gradle Setup
+        uses: ./.github/actions/gradle-setup
+        with:
+          java-version: ${{ inputs.java-version }}
+          ndk-version: ${{ inputs.ndk-version }}
+
+      - name: Download shared detekt config
+        if: inputs.detekt-config-repo != ''
+        shell: bash
+        run: |
+          mkdir -p config
+          curl -fsSL "https://raw.githubusercontent.com/${{ inputs.detekt-config-repo }}/main/configs/detekt.yml" \
+            -o config/detekt.yml
+
+      - name: Extra setup
+        if: inputs.extra-setup-script != ''
+        shell: bash
+        run: ${{ inputs.extra-setup-script }}
+
+      - name: Run Android Lint
+        working-directory: ${{ inputs.working-directory }}
+        run: ./gradlew ${{ inputs.lint-task }} --no-daemon
+
+      - name: Upload lint SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: .
+          category: android-lint
+        continue-on-error: true
+
+      - name: Upload lint results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-results
+          path: |
+            **/build/reports/lint-results*.html
+            **/build/reports/lint-results*.xml
+
+  unit-test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: ${{ inputs.submodules && 'recursive' || 'false' }}
+          lfs: ${{ inputs.lfs }}
+
+      - name: Gradle Setup
+        uses: ./.github/actions/gradle-setup
+        with:
+          java-version: ${{ inputs.java-version }}
+          ndk-version: ${{ inputs.ndk-version }}
+
+      - name: Extra setup
+        if: inputs.extra-setup-script != ''
+        shell: bash
+        run: ${{ inputs.extra-setup-script }}
+
+      - name: Run unit tests
+        working-directory: ${{ inputs.working-directory }}
+        run: ./gradlew ${{ inputs.test-task }} --no-daemon
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-results
+          path: |
+            **/build/reports/tests/
+            **/build/test-results/
+
+  screenshot-test:
+    name: Screenshot Tests
+    if: inputs.screenshot-task != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: ${{ inputs.submodules && 'recursive' || 'false' }}
+          lfs: ${{ inputs.lfs }}
+
+      - name: Gradle Setup
+        uses: ./.github/actions/gradle-setup
+        with:
+          java-version: ${{ inputs.java-version }}
+          ndk-version: ${{ inputs.ndk-version }}
+
+      - name: Extra setup
+        if: inputs.extra-setup-script != ''
+        shell: bash
+        run: ${{ inputs.extra-setup-script }}
+
+      - name: Run screenshot verification
+        uses: ./.github/actions/screenshot-test
+        with:
+          screenshot-task: ${{ inputs.screenshot-task }}
+          working-directory: ${{ inputs.working-directory }}
+
+  license-check:
+    name: License Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: License review
+        uses: ./.github/actions/license-check
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: ${{ inputs.submodules && 'recursive' || 'false' }}
+          lfs: ${{ inputs.lfs }}
+
+      - name: Gradle Setup
+        uses: ./.github/actions/gradle-setup
+        with:
+          java-version: ${{ inputs.java-version }}
+          ndk-version: ${{ inputs.ndk-version }}
+
+      - name: Extra setup
+        if: inputs.extra-setup-script != ''
+        shell: bash
+        run: ${{ inputs.extra-setup-script }}
+
+      - name: Build APK
+        working-directory: ${{ inputs.working-directory }}
+        run: ./gradlew ${{ inputs.gradle-task }} --no-daemon
+
+      - name: Find APK
+        id: find-apk
+        shell: bash
+        run: |
+          APK_PATH=$(find "${{ inputs.app-module }}/build/outputs/apk" -name "*.apk" | head -1)
+          if [ -z "$APK_PATH" ]; then
+            echo "::error::No APK found"
+            exit 1
+          fi
+          echo "apk_path=$APK_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Verify APK
+        uses: ./.github/actions/apk-verify
+        with:
+          apk-path: ${{ steps.find-apk.outputs.apk_path }}
+          expected-native-libs: ${{ inputs.expected-native-libs }}
+          min-size-bytes: ${{ inputs.min-apk-size }}
+          check-alignment: ${{ inputs.check-alignment }}
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-apk
+          path: ${{ steps.find-apk.outputs.apk_path }}
+
+  size-diff:
+    name: Size Diff
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: ${{ inputs.submodules && 'recursive' || 'false' }}
+          lfs: ${{ inputs.lfs }}
+
+      - name: Gradle Setup
+        uses: ./.github/actions/gradle-setup
+        with:
+          java-version: ${{ inputs.java-version }}
+          ndk-version: ${{ inputs.ndk-version }}
+
+      - name: Download current APK
+        uses: actions/download-artifact@v4
+        with:
+          name: pr-apk
+          path: current-apk
+
+      - name: Find current APK
+        id: current-apk
+        shell: bash
+        run: |
+          APK_PATH=$(find current-apk -name "*.apk" | head -1)
+          echo "path=$APK_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Size diff
+        uses: ./.github/actions/size-diff
+        with:
+          current-apk-path: ${{ steps.current-apk.outputs.path }}
+          app-module: ${{ inputs.app-module }}
+          gradle-task: ${{ inputs.gradle-task }}
+          working-directory: ${{ inputs.working-directory }}
+
+  smoke-test:
+    name: Smoke Test
+    needs: build
+    if: inputs.package-name != ''
+    runs-on: self-hosted
+    concurrency:
+      group: emulator
+      cancel-in-progress: false
+    steps:
+      - name: Download APK
+        uses: actions/download-artifact@v4
+        with:
+          name: pr-apk
+          path: smoke-apk
+
+      - name: Find APK
+        id: find-apk
+        shell: bash
+        run: |
+          APK_PATH=$(find smoke-apk -name "*.apk" | head -1)
+          echo "path=$APK_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout (for composite action)
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions/emulator-smoke
+
+      - name: Smoke test
+        uses: ./.github/actions/emulator-smoke
+        with:
+          apk-path: ${{ steps.find-apk.outputs.path }}
+          package-name: ${{ inputs.package-name }}
+          main-activity: ${{ inputs.main-activity }}
+
+  e2e:
+    name: E2E Tests
+    needs: build
+    if: inputs.has-instrumentation-tests
+    runs-on: self-hosted
+    concurrency:
+      group: emulator
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: ${{ inputs.submodules && 'recursive' || 'false' }}
+          lfs: ${{ inputs.lfs }}
+
+      - name: Gradle Setup
+        uses: ./.github/actions/gradle-setup
+        with:
+          java-version: ${{ inputs.java-version }}
+          ndk-version: ${{ inputs.ndk-version }}
+
+      - name: Extra setup
+        if: inputs.extra-setup-script != ''
+        shell: bash
+        run: ${{ inputs.extra-setup-script }}
+
+      - name: Run instrumentation tests
+        working-directory: ${{ inputs.working-directory }}
+        run: ./gradlew connectedDebugAndroidTest --no-daemon
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-results
+          path: '**/build/reports/androidTests/'
