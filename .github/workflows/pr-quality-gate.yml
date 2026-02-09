@@ -300,17 +300,46 @@ jobs:
           APK_PATH=$(find smoke-apk -name "*.apk" | head -1)
           echo "path=$APK_PATH" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout (for composite action)
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: .github/actions/emulator-smoke
+      - name: Wait for emulator
+        run: |
+          adb wait-for-device
+          TIMEOUT=120; ELAPSED=0
+          while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" != "1" ]; do
+            [ $ELAPSED -ge $TIMEOUT ] && echo "::error::Emulator boot timeout" && exit 1
+            sleep 2; ELAPSED=$((ELAPSED + 2))
+          done
 
-      - name: Smoke test
-        uses: ./.github/actions/emulator-smoke
-        with:
-          apk-path: ${{ steps.find-apk.outputs.path }}
-          package-name: ${{ inputs.package-name }}
-          main-activity: ${{ inputs.main-activity }}
+      - name: Install and smoke test
+        run: |
+          PACKAGE="${{ inputs.package-name }}"
+          ACTIVITY="${{ inputs.main-activity }}"
+          APK="${{ steps.find-apk.outputs.path }}"
+
+          adb install -r "$APK"
+          adb shell am force-stop "$PACKAGE"
+          adb shell pm clear "$PACKAGE" 2>/dev/null || true
+          adb logcat -c
+          adb shell am start -n "${PACKAGE}/${ACTIVITY}"
+          sleep 15
+
+          CRASH_LOG=$(adb shell logcat -d -s AndroidRuntime:E)
+          ACTIVITY_STATUS=$(adb shell dumpsys activity activities 2>/dev/null | grep "$PACKAGE" || true)
+
+          if echo "$CRASH_LOG" | grep -q "FATAL EXCEPTION"; then
+            echo "::error::App crashed on launch!"
+            echo "$CRASH_LOG"
+            FAILED=1
+          fi
+          if [ -z "$ACTIVITY_STATUS" ]; then
+            echo "::error::Activity is no longer running"
+            FAILED=1
+          fi
+
+          adb shell am force-stop "$PACKAGE" 2>/dev/null || true
+          adb uninstall "$PACKAGE" 2>/dev/null || true
+
+          [ "${FAILED:-0}" = "1" ] && exit 1
+          echo "Smoke test PASSED"
 
   e2e:
     name: E2E Tests
