@@ -57,7 +57,6 @@ on:
 
 permissions:
   contents: write
-  issues: read
 
 jobs:
   release:
