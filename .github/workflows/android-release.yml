@@ -56,8 +56,10 @@ on:
       KEY_PASSWORD:
         required: false
 
-permissions:
-  contents: read
+# NOTE: Do NOT add a permissions block here. Reusable workflows from public repos
+# that request elevated permissions cause startup_failure for private callers.
+# Instead, callers must specify their own permissions block.
+# The reusable workflow inherits the caller's permissions when none are specified.
 
 jobs:
   security-gate:

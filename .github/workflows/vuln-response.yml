@@ -8,9 +8,8 @@ on:
         type: number
         default: 9.0
 
-permissions:
-  contents: read
-  issues: read
+# NOTE: Do NOT add a permissions block here. Callers must specify their own
+# permissions (contents: write, issues: write) to avoid startup_failure.
 
 jobs:
   scan:
