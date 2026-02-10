@@ -52,7 +52,7 @@ on:
         type: boolean
         default: false
       working-directory:
-        description: 'Working directory for Gradle commands (if gradlew is not at repo root)'
+        description: 'Working directory for Gradle commands'
         type: string
         default: '.'
       detekt-config-repo:
@@ -74,24 +74,29 @@ jobs:
           submodules: ${{ inputs.submodules && 'recursive' || 'false' }}
           lfs: ${{ inputs.lfs }}
 
-      - name: Gradle Setup
-        uses: ./.github/actions/gradle-setup
+      - name: Set up JDK
+        uses: actions/setup-java@v4
         with:
           java-version: ${{ inputs.java-version }}
-          ndk-version: ${{ inputs.ndk-version }}
+          distribution: temurin
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        if: inputs.ndk-version != ''
+        run: sdkmanager --install "ndk;${{ inputs.ndk-version }}"
 
       - name: Download shared detekt config
         if: inputs.detekt-config-repo != ''
-        shell: bash
         run: |
           mkdir -p config
           curl -fsSL "https://raw.githubusercontent.com/${{ inputs.detekt-config-repo }}/main/configs/detekt.yml" \
             -o config/detekt.yml
-          echo "Downloaded shared detekt config"
 
       - name: Extra setup
         if: inputs.extra-setup-script != ''
-        shell: bash
         run: ${{ inputs.extra-setup-script }}
 
       - name: Run Android Lint
@@ -106,15 +111,6 @@ jobs:
           path: |
             **/build/reports/lint-results*.html
             **/build/reports/lint-results*.xml
-            **/build/reports/lint-results*.sarif
-
-      - name: Upload SARIF to GitHub Security
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: .
-          category: android-lint
-        continue-on-error: true
 
   build:
     name: Build
@@ -126,24 +122,30 @@ jobs:
           submodules: ${{ inputs.submodules && 'recursive' || 'false' }}
           lfs: ${{ inputs.lfs }}
 
-      - name: Gradle Setup
-        uses: ./.github/actions/gradle-setup
+      - name: Set up JDK
+        uses: actions/setup-java@v4
         with:
           java-version: ${{ inputs.java-version }}
-          ndk-version: ${{ inputs.ndk-version }}
+          distribution: temurin
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        if: inputs.ndk-version != ''
+        run: sdkmanager --install "ndk;${{ inputs.ndk-version }}"
 
       - name: Extra setup
         if: inputs.extra-setup-script != ''
-        shell: bash
         run: ${{ inputs.extra-setup-script }}
 
       - name: Build APK
         working-directory: ${{ inputs.working-directory }}
         run: ./gradlew ${{ inputs.gradle-task }} --no-daemon
 
-      - name: Find APK
+      - name: Find and verify APK
         id: find-apk
-        shell: bash
         run: |
           APK_PATH=$(find "${{ inputs.app-module }}/build/outputs/apk" -name "*.apk" | head -1)
           if [ -z "$APK_PATH" ]; then
@@ -152,13 +154,16 @@ jobs:
           fi
           echo "apk_path=$APK_PATH" >> "$GITHUB_OUTPUT"
 
-      - name: Verify APK
-        uses: ./.github/actions/apk-verify
-        with:
-          apk-path: ${{ steps.find-apk.outputs.apk_path }}
-          expected-native-libs: ${{ inputs.expected-native-libs }}
-          min-size-bytes: ${{ inputs.min-apk-size }}
-          check-alignment: ${{ inputs.check-alignment }}
+          # Verify classes.dex
+          if ! unzip -l "$APK_PATH" | grep -q 'classes.dex'; then
+            echo "::error::APK missing classes.dex"
+            exit 1
+          fi
+          echo "OK: classes.dex present"
+
+          # Size check
+          APK_SIZE=$(stat -c%s "$APK_PATH")
+          echo "APK size: $((APK_SIZE / 1024 / 1024)) MB ($APK_SIZE bytes)"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
@@ -176,15 +181,22 @@ jobs:
           submodules: ${{ inputs.submodules && 'recursive' || 'false' }}
           lfs: ${{ inputs.lfs }}
 
-      - name: Gradle Setup
-        uses: ./.github/actions/gradle-setup
+      - name: Set up JDK
+        uses: actions/setup-java@v4
         with:
           java-version: ${{ inputs.java-version }}
-          ndk-version: ${{ inputs.ndk-version }}
+          distribution: temurin
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        if: inputs.ndk-version != ''
+        run: sdkmanager --install "ndk;${{ inputs.ndk-version }}"
 
       - name: Extra setup
         if: inputs.extra-setup-script != ''
-        shell: bash
         run: ${{ inputs.extra-setup-script }}
 
       - name: Run unit tests

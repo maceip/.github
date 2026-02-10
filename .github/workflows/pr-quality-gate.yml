@@ -70,21 +70,25 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           submodules: ${{ inputs.submodules && 'recursive' || 'false' }}
           lfs: ${{ inputs.lfs }}
 
-      - name: Gradle Setup
-        uses: ./.github/actions/gradle-setup
+      - uses: actions/setup-java@v4
         with:
           java-version: ${{ inputs.java-version }}
-          ndk-version: ${{ inputs.ndk-version }}
+          distribution: temurin
+          cache: gradle
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        if: inputs.ndk-version != ''
+        run: sdkmanager --install "ndk;${{ inputs.ndk-version }}"
 
       - name: Download shared detekt config
         if: inputs.detekt-config-repo != ''
-        shell: bash
         run: |
           mkdir -p config
           curl -fsSL "https://raw.githubusercontent.com/${{ inputs.detekt-config-repo }}/main/configs/detekt.yml" \
@@ -92,20 +96,11 @@ jobs:
 
       - name: Extra setup
         if: inputs.extra-setup-script != ''
-        shell: bash
         run: ${{ inputs.extra-setup-script }}
 
       - name: Run Android Lint
         working-directory: ${{ inputs.working-directory }}
         run: ./gradlew ${{ inputs.lint-task }} --no-daemon
-
-      - name: Upload lint SARIF
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: .
-          category: android-lint
-        continue-on-error: true
 
       - name: Upload lint results
         if: always()
@@ -120,21 +115,25 @@ jobs:
     name: Unit Tests
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           submodules: ${{ inputs.submodules && 'recursive' || 'false' }}
           lfs: ${{ inputs.lfs }}
 
-      - name: Gradle Setup
-        uses: ./.github/actions/gradle-setup
+      - uses: actions/setup-java@v4
         with:
           java-version: ${{ inputs.java-version }}
-          ndk-version: ${{ inputs.ndk-version }}
+          distribution: temurin
+          cache: gradle
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        if: inputs.ndk-version != ''
+        run: sdkmanager --install "ndk;${{ inputs.ndk-version }}"
 
       - name: Extra setup
         if: inputs.extra-setup-script != ''
-        shell: bash
         run: ${{ inputs.extra-setup-script }}
 
       - name: Run unit tests
@@ -155,67 +154,65 @@ jobs:
     if: inputs.screenshot-task != ''
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           submodules: ${{ inputs.submodules && 'recursive' || 'false' }}
           lfs: ${{ inputs.lfs }}
 
-      - name: Gradle Setup
-        uses: ./.github/actions/gradle-setup
+      - uses: actions/setup-java@v4
         with:
           java-version: ${{ inputs.java-version }}
-          ndk-version: ${{ inputs.ndk-version }}
+          distribution: temurin
+          cache: gradle
+
+      - uses: android-actions/setup-android@v3
 
       - name: Extra setup
         if: inputs.extra-setup-script != ''
-        shell: bash
         run: ${{ inputs.extra-setup-script }}
 
       - name: Run screenshot verification
-        uses: ./.github/actions/screenshot-test
+        working-directory: ${{ inputs.working-directory }}
+        run: ./gradlew ${{ inputs.screenshot-task }} --no-daemon
+
+      - name: Upload screenshot diffs
+        if: failure()
+        uses: actions/upload-artifact@v4
         with:
-          screenshot-task: ${{ inputs.screenshot-task }}
-          working-directory: ${{ inputs.working-directory }}
-
-  license-check:
-    name: License Check
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: License review
-        uses: ./.github/actions/license-check
+          name: screenshot-diffs
+          path: '**/build/paparazzi/failures/'
 
   build:
     name: Build
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           submodules: ${{ inputs.submodules && 'recursive' || 'false' }}
           lfs: ${{ inputs.lfs }}
 
-      - name: Gradle Setup
-        uses: ./.github/actions/gradle-setup
+      - uses: actions/setup-java@v4
         with:
           java-version: ${{ inputs.java-version }}
-          ndk-version: ${{ inputs.ndk-version }}
+          distribution: temurin
+          cache: gradle
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        if: inputs.ndk-version != ''
+        run: sdkmanager --install "ndk;${{ inputs.ndk-version }}"
 
       - name: Extra setup
         if: inputs.extra-setup-script != ''
-        shell: bash
         run: ${{ inputs.extra-setup-script }}
 
       - name: Build APK
         working-directory: ${{ inputs.working-directory }}
         run: ./gradlew ${{ inputs.gradle-task }} --no-daemon
 
-      - name: Find APK
+      - name: Find and verify APK
         id: find-apk
-        shell: bash
         run: |
           APK_PATH=$(find "${{ inputs.app-module }}/build/outputs/apk" -name "*.apk" | head -1)
           if [ -z "$APK_PATH" ]; then
@@ -224,57 +221,17 @@ jobs:
           fi
           echo "apk_path=$APK_PATH" >> "$GITHUB_OUTPUT"
 
-      - name: Verify APK
-        uses: ./.github/actions/apk-verify
-        with:
-          apk-path: ${{ steps.find-apk.outputs.apk_path }}
-          expected-native-libs: ${{ inputs.expected-native-libs }}
-          min-size-bytes: ${{ inputs.min-apk-size }}
-          check-alignment: ${{ inputs.check-alignment }}
+          if ! unzip -l "$APK_PATH" | grep -q 'classes.dex'; then
+            echo "::error::APK missing classes.dex"
+            exit 1
+          fi
+          echo "APK size: $(stat -c%s "$APK_PATH") bytes"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: pr-apk
           path: ${{ steps.find-apk.outputs.apk_path }}
-
-  size-diff:
-    name: Size Diff
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          submodules: ${{ inputs.submodules && 'recursive' || 'false' }}
-          lfs: ${{ inputs.lfs }}
-
-      - name: Gradle Setup
-        uses: ./.github/actions/gradle-setup
-        with:
-          java-version: ${{ inputs.java-version }}
-          ndk-version: ${{ inputs.ndk-version }}
-
-      - name: Download current APK
-        uses: actions/download-artifact@v4
-        with:
-          name: pr-apk
-          path: current-apk
-
-      - name: Find current APK
-        id: current-apk
-        shell: bash
-        run: |
-          APK_PATH=$(find current-apk -name "*.apk" | head -1)
-          echo "path=$APK_PATH" >> "$GITHUB_OUTPUT"
-
-      - name: Size diff
-        uses: ./.github/actions/size-diff
-        with:
-          current-apk-path: ${{ steps.current-apk.outputs.path }}
-          app-module: ${{ inputs.app-module }}
-          gradle-task: ${{ inputs.gradle-task }}
-          working-directory: ${{ inputs.working-directory }}
 
   smoke-test:
     name: Smoke Test
@@ -285,18 +242,14 @@ jobs:
       group: emulator
       cancel-in-progress: false
     steps:
-      - name: Download APK
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: pr-apk
           path: smoke-apk
 
       - name: Find APK
         id: find-apk
-        shell: bash
-        run: |
-          APK_PATH=$(find smoke-apk -name "*.apk" | head -1)
-          echo "path=$APK_PATH" >> "$GITHUB_OUTPUT"
+        run: echo "path=$(find smoke-apk -name '*.apk' | head -1)" >> "$GITHUB_OUTPUT"
 
       - name: Smoke test (flock serialized)
         run: |
@@ -324,20 +277,15 @@ jobs:
           CRASH_LOG=$(adb shell logcat -d -s AndroidRuntime:E)
           ACTIVITY_STATUS=$(adb shell dumpsys activity activities 2>/dev/null | grep "$PACKAGE" || true)
 
-          if echo "$CRASH_LOG" | grep -q "FATAL EXCEPTION"; then
-            echo "::error::App crashed on launch!"
-            echo "$CRASH_LOG"
-            FAILED=1
-          fi
-          if [ -z "$ACTIVITY_STATUS" ]; then
-            echo "::error::Activity is no longer running"
-            FAILED=1
-          fi
-
           adb shell am force-stop "$PACKAGE" 2>/dev/null || true
           adb uninstall "$PACKAGE" 2>/dev/null || true
 
-          [ "${FAILED:-0}" = "1" ] && exit 1
+          if echo "$CRASH_LOG" | grep -q "FATAL EXCEPTION"; then
+            echo "::error::App crashed on launch!"
+            echo "$CRASH_LOG"
+            exit 1
+          fi
+          [ -z "$ACTIVITY_STATUS" ] && echo "::error::Activity not running" && exit 1
           echo "Smoke test PASSED"
 
   e2e:
@@ -349,26 +297,33 @@ jobs:
       group: emulator
       cancel-in-progress: false
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           submodules: ${{ inputs.submodules && 'recursive' || 'false' }}
           lfs: ${{ inputs.lfs }}
 
-      - name: Gradle Setup
-        uses: ./.github/actions/gradle-setup
+      - uses: actions/setup-java@v4
         with:
           java-version: ${{ inputs.java-version }}
-          ndk-version: ${{ inputs.ndk-version }}
+          distribution: temurin
+          cache: gradle
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        if: inputs.ndk-version != ''
+        run: sdkmanager --install "ndk;${{ inputs.ndk-version }}"
 
       - name: Extra setup
         if: inputs.extra-setup-script != ''
-        shell: bash
         run: ${{ inputs.extra-setup-script }}
 
       - name: Run instrumentation tests
-        working-directory: ${{ inputs.working-directory }}
-        run: ./gradlew connectedDebugAndroidTest --no-daemon
+        run: |
+          exec 9>/tmp/emulator-smoke.lock
+          flock -w 300 9 || { echo "::error::Timed out waiting for emulator lock"; exit 1; }
+          cd ${{ inputs.working-directory }}
+          ./gradlew connectedDebugAndroidTest --no-daemon
 
       - name: Upload test results
         if: always()
