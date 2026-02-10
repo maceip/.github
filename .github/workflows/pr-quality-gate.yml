@@ -300,8 +300,11 @@ jobs:
           APK_PATH=$(find smoke-apk -name "*.apk" | head -1)
           echo "path=$APK_PATH" >> "$GITHUB_OUTPUT"
 
-      - name: Wait for emulator
+      - name: Smoke test (flock serialized)
         run: |
+          exec 9>/tmp/emulator-smoke.lock
+          flock -w 300 9 || { echo "::error::Timed out waiting for emulator lock"; exit 1; }
+
           adb wait-for-device
           TIMEOUT=120; ELAPSED=0
           while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" != "1" ]; do
@@ -309,8 +312,6 @@ jobs:
             sleep 2; ELAPSED=$((ELAPSED + 2))
           done
 
-      - name: Install and smoke test
-        run: |
           PACKAGE="${{ inputs.package-name }}"
           ACTIVITY="${{ inputs.main-activity }}"
           APK="${{ steps.find-apk.outputs.path }}"
