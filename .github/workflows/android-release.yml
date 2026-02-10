@@ -95,15 +95,20 @@ jobs:
           submodules: ${{ inputs.submodules && 'recursive' || 'false' }}
           lfs: ${{ inputs.lfs }}
 
-      - name: Gradle Setup
-        uses: ./.github/actions/gradle-setup
+      - uses: actions/setup-java@v4
         with:
           java-version: ${{ inputs.java-version }}
-          ndk-version: ${{ inputs.ndk-version }}
+          distribution: temurin
+          cache: gradle
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        if: inputs.ndk-version != ''
+        run: sdkmanager --install "ndk;${{ inputs.ndk-version }}"
 
       - name: Extra setup
         if: inputs.extra-setup-script != ''
-        shell: bash
         run: ${{ inputs.extra-setup-script }}
 
       - name: Decode signing keystore
@@ -140,20 +145,56 @@ jobs:
           echo "apk_path=$APK_PATH" >> "$GITHUB_OUTPUT"
 
       - name: Verify APK
-        uses: ./.github/actions/apk-verify
-        with:
-          apk-path: ${{ steps.find-apk.outputs.apk_path }}
-          expected-native-libs: ${{ inputs.expected-native-libs }}
-          min-size-bytes: ${{ inputs.min-apk-size }}
-          check-alignment: ${{ inputs.check-alignment }}
+        run: |
+          APK="${{ steps.find-apk.outputs.apk_path }}"
+          echo "=== APK contents ==="
+          unzip -l "$APK" | grep -E '\.so|\.dex|\.wasm|\.aot|classes' | head -30
 
-      - name: Generate SBOM
-        uses: ./.github/actions/sbom-generate
-        with:
-          app-module: ${{ inputs.app-module }}
-          app-name: ${{ inputs.app-name }}
-          app-version: ${{ steps.version.outputs.new_version || '0.0.0' }}
-          working-directory: ${{ inputs.working-directory }}
+          if ! unzip -l "$APK" | grep -q 'classes.dex'; then
+            echo "::error::APK missing classes.dex"
+            exit 1
+          fi
+          echo "OK: classes.dex present"
+
+          if [ -n "${{ inputs.expected-native-libs }}" ]; then
+            IFS=',' read -ra LIBS <<< "${{ inputs.expected-native-libs }}"
+            for lib in "${LIBS[@]}"; do
+              lib=$(echo "$lib" | xargs)
+              if ! unzip -l "$APK" | grep -q "$lib"; then
+                echo "::error::APK missing expected native library: $lib"
+                exit 1
+              fi
+              echo "OK: $lib present"
+            done
+          fi
+
+          APK_SIZE=$(stat -c%s "$APK")
+          echo "APK size: $((APK_SIZE / 1024 / 1024)) MB ($APK_SIZE bytes)"
+
+          MIN=${{ inputs.min-apk-size }}
+          if [ "$MIN" -gt 0 ] && [ "$APK_SIZE" -lt "$MIN" ]; then
+            echo "::error::APK too small: $APK_SIZE bytes (minimum: $MIN)"
+            exit 1
+          fi
+
+          if [ "${{ inputs.check-alignment }}" = "true" ]; then
+            echo "=== Checking 16KB ELF alignment ==="
+            TMPDIR=$(mktemp -d)
+            unzip -q -o "$APK" 'lib/arm64-v8a/*.so' -d "$TMPDIR" 2>/dev/null || true
+            if [ -d "$TMPDIR/lib/arm64-v8a" ]; then
+              for so in "$TMPDIR"/lib/arm64-v8a/*.so; do
+                NAME=$(basename "$so")
+                ALIGNMENT=$(readelf -l "$so" 2>/dev/null | grep "LOAD" | head -1 | awk '{print $NF}')
+                if [ -n "$ALIGNMENT" ] && [ "$ALIGNMENT" != "0x4000" ]; then
+                  echo "::warning::$NAME alignment is $ALIGNMENT (expected 0x4000)"
+                else
+                  echo "OK: $NAME alignment ($ALIGNMENT)"
+                fi
+              done
+            fi
+            rm -rf "$TMPDIR"
+          fi
+          echo "=== All APK verification checks passed ==="
 
       - name: Get next version
         id: version
@@ -165,6 +206,242 @@ jobs:
           if [ "$PATCH" -ge 100 ]; then PATCH=0; MINOR=$((MINOR + 1)); fi
           if [ "$MINOR" -ge 100 ]; then MINOR=0; MAJOR=$((MAJOR + 1)); fi
           echo "new_version=v${MAJOR}.${MINOR}.${PATCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate dependency report
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          ./gradlew ${{ inputs.app-module }}:dependencies --configuration releaseRuntimeClasspath > dependencies-full.txt 2>&1 || true
+          ./gradlew ${{ inputs.app-module }}:dependencies --configuration debugRuntimeClasspath >> dependencies-full.txt 2>&1 || true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: pip install requests matplotlib numpy
+
+      - name: Generate SBOM and staleness analysis
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          APP_NAME: ${{ inputs.app-name }}
+          APP_VERSION: ${{ steps.version.outputs.new_version }}
+        run: |
+          cat << 'PYTHON_SCRIPT' > generate_sbom.py
+          import json, re, requests, os
+          from datetime import datetime
+          from collections import defaultdict
+          import matplotlib.pyplot as plt
+          import matplotlib.patches as mpatches
+          import numpy as np
+
+          plt.style.use('dark_background')
+          COLORS = {
+              'bg': '#0d1117', 'card': '#161b22', 'border': '#30363d',
+              'text': '#c9d1d9', 'green': '#3fb950', 'yellow': '#d29922',
+              'orange': '#db6d28', 'red': '#f85149', 'gray': '#484f58',
+              'purple': '#a371f7', 'blue': '#58a6ff'
+          }
+
+          def parse_gradle_dependencies(file_path):
+              deps = {}
+              with open(file_path, 'r') as f:
+                  content = f.read()
+              pattern = r'[+\\]--- ([a-zA-Z0-9._-]+):([a-zA-Z0-9._-]+):([0-9a-zA-Z._-]+)'
+              for group, artifact, version in re.findall(pattern, content):
+                  key = f"{group}:{artifact}"
+                  if key not in deps:
+                      deps[key] = {'group': group, 'artifact': artifact, 'version': version}
+              return deps
+
+          def get_maven_metadata(group, artifact):
+              group_path = group.replace('.', '/')
+              for url in [
+                  f"https://repo1.maven.org/maven2/{group_path}/{artifact}/maven-metadata.xml",
+                  f"https://dl.google.com/dl/android/maven2/{group_path}/{artifact}/maven-metadata.xml"
+              ]:
+                  try:
+                      resp = requests.get(url, timeout=10)
+                      if resp.status_code == 200:
+                          latest = re.search(r'<release>([^<]+)</release>', resp.text)
+                          if not latest:
+                              latest = re.search(r'<latest>([^<]+)</latest>', resp.text)
+                          return {
+                              'latest': latest.group(1) if latest else None,
+                              'versions': re.findall(r'<version>([^<]+)</version>', resp.text)
+                          }
+                  except Exception:
+                      pass
+              return None
+
+          def main():
+              app_name = os.environ.get('APP_NAME', 'android-app')
+              app_version = os.environ.get('APP_VERSION', '0.0.0')
+              print("Parsing dependencies...")
+              deps = parse_gradle_dependencies('dependencies-full.txt')
+              print(f"Found {len(deps)} dependencies")
+
+              sbom = {
+                  'bomFormat': 'CycloneDX', 'specVersion': '1.4', 'version': 1,
+                  'metadata': {
+                      'timestamp': datetime.utcnow().isoformat() + 'Z',
+                      'component': {'type': 'application', 'name': app_name, 'version': app_version}
+                  },
+                  'components': []
+              }
+              staleness_data = []
+
+              for i, (key, dep) in enumerate(deps.items()):
+                  print(f"  [{i+1}/{len(deps)}] {key}")
+                  metadata = get_maven_metadata(dep['group'], dep['artifact'])
+                  component = {
+                      'type': 'library', 'group': dep['group'], 'name': dep['artifact'],
+                      'version': dep['version'],
+                      'purl': f"pkg:maven/{dep['group']}/{dep['artifact']}@{dep['version']}"
+                  }
+                  staleness = {
+                      'dependency': key, 'current_version': dep['version'],
+                      'latest_version': None, 'versions_behind': None, 'status': 'unknown'
+                  }
+                  if metadata and metadata.get('latest'):
+                      staleness['latest_version'] = metadata['latest']
+                      component['latestVersion'] = metadata['latest']
+                      if dep['version'] == metadata['latest']:
+                          staleness['status'] = 'up-to-date'
+                      else:
+                          versions = metadata.get('versions', [])
+                          try:
+                              behind = len(versions) - versions.index(dep['version']) - 1
+                              staleness['versions_behind'] = behind
+                              staleness['status'] = 'up-to-date' if behind == 0 else \
+                                  'slightly-outdated' if behind <= 2 else \
+                                  'outdated' if behind <= 5 else 'very-outdated'
+                          except ValueError:
+                              staleness['status'] = 'outdated'
+                  sbom['components'].append(component)
+                  staleness_data.append(staleness)
+
+              with open('sbom.json', 'w') as f:
+                  json.dump(sbom, f, indent=2)
+
+              summary = {
+                  'total': len(staleness_data),
+                  'up_to_date': sum(1 for s in staleness_data if s['status'] == 'up-to-date'),
+                  'slightly_outdated': sum(1 for s in staleness_data if s['status'] == 'slightly-outdated'),
+                  'outdated': sum(1 for s in staleness_data if s['status'] == 'outdated'),
+                  'very_outdated': sum(1 for s in staleness_data if s['status'] == 'very-outdated'),
+                  'unknown': sum(1 for s in staleness_data if s['status'] == 'unknown')
+              }
+              report = {
+                  'generated_at': datetime.utcnow().isoformat() + 'Z',
+                  'summary': summary,
+                  'dependencies': sorted(staleness_data, key=lambda x: -(x['versions_behind'] or 0))
+              }
+              with open('staleness-report.json', 'w') as f:
+                  json.dump(report, f, indent=2)
+
+              fig = plt.figure(figsize=(16, 10), facecolor=COLORS['bg'])
+              fig.suptitle(f'{app_name} - Dependency Staleness', fontsize=20, fontweight='bold',
+                          color=COLORS['text'], y=0.98)
+              gs = fig.add_gridspec(2, 3, hspace=0.3, wspace=0.3,
+                                   left=0.06, right=0.94, top=0.9, bottom=0.08)
+
+              ax1 = fig.add_subplot(gs[0, 0])
+              ax1.set_facecolor(COLORS['bg'])
+              labels = ['Up to Date', 'Slightly Outdated', 'Outdated', 'Very Outdated', 'Unknown']
+              sizes = [summary['up_to_date'], summary['slightly_outdated'], summary['outdated'],
+                      summary['very_outdated'], summary['unknown']]
+              colors = [COLORS['green'], COLORS['yellow'], COLORS['orange'], COLORS['red'], COLORS['gray']]
+              non_zero = [(l,s,c) for l,s,c in zip(labels, sizes, colors) if s > 0]
+              if non_zero:
+                  l, s, c = zip(*non_zero)
+                  wedges, texts, autotexts = ax1.pie(s, colors=c, autopct='%1.0f%%',
+                      startangle=90, pctdistance=0.75,
+                      wedgeprops=dict(width=0.5, edgecolor=COLORS['bg'], linewidth=2))
+                  for t in autotexts:
+                      t.set_color('white'); t.set_fontweight('bold'); t.set_fontsize(10)
+                  ax1.legend(wedges, l, loc='center', fontsize=8,
+                            frameon=False, labelcolor=COLORS['text'])
+              ax1.set_title('Status Distribution', color=COLORS['text'], fontsize=12, pad=10)
+
+              ax2 = fig.add_subplot(gs[0, 1])
+              ax2.set_facecolor(COLORS['card']); ax2.set_xlim(0, 10); ax2.set_ylim(0, 10); ax2.axis('off')
+              stats_text = f"SUMMARY\n\nTotal: {summary['total']}\n\nUp to Date: {summary['up_to_date']}\nSlight Lag: {summary['slightly_outdated']}\nOutdated: {summary['outdated']}\nCritical: {summary['very_outdated']}\nUnknown: {summary['unknown']}"
+              ax2.text(0.5, 0.5, stats_text, transform=ax2.transAxes, fontsize=11,
+                      color=COLORS['text'], verticalalignment='center', fontfamily='monospace', linespacing=1.8)
+              rect = mpatches.FancyBboxPatch((0.02, 0.02), 9.96, 9.96,
+                  boxstyle="round,pad=0.02,rounding_size=0.5",
+                  facecolor=COLORS['card'], edgecolor=COLORS['border'], linewidth=2)
+              ax2.add_patch(rect)
+
+              ax3 = fig.add_subplot(gs[0, 2]); ax3.set_facecolor(COLORS['card'])
+              behind = [s['versions_behind'] for s in staleness_data if s['versions_behind'] and s['versions_behind'] > 0]
+              if behind:
+                  bins = range(0, max(behind) + 2)
+                  ax3.hist(behind, bins=bins, color=COLORS['blue'], edgecolor=COLORS['bg'], linewidth=1, alpha=0.8, rwidth=0.85)
+                  ax3.set_xlabel('Versions Behind', color=COLORS['text'], fontsize=10)
+                  ax3.set_ylabel('Count', color=COLORS['text'], fontsize=10)
+              ax3.set_title('Version Lag Distribution', color=COLORS['text'], fontsize=12, pad=10)
+              ax3.tick_params(colors=COLORS['text'])
+              for spine in ax3.spines.values(): spine.set_color(COLORS['border'])
+
+              ax4 = fig.add_subplot(gs[1, :2]); ax4.set_facecolor(COLORS['card'])
+              outdated = sorted([s for s in staleness_data if s['versions_behind'] and s['versions_behind'] > 0],
+                              key=lambda x: -x['versions_behind'])[:12]
+              if outdated:
+                  names = [d['dependency'].split(':')[1][:25] for d in outdated]
+                  vals = [d['versions_behind'] for d in outdated]
+                  colors_bar = [COLORS['red'] if v > 10 else COLORS['orange'] if v > 5 else COLORS['yellow'] for v in vals]
+                  bars = ax4.barh(names, vals, color=colors_bar, edgecolor=COLORS['bg'], height=0.7)
+                  ax4.set_xlabel('Versions Behind Latest', color=COLORS['text'], fontsize=10)
+                  ax4.invert_yaxis()
+                  for bar, val in zip(bars, vals):
+                      ax4.text(val + 0.3, bar.get_y() + bar.get_height()/2, str(val),
+                              va='center', color=COLORS['text'], fontsize=9)
+              ax4.set_title('Most Outdated Dependencies', color=COLORS['text'], fontsize=12, pad=10)
+              ax4.tick_params(colors=COLORS['text'])
+              for spine in ax4.spines.values(): spine.set_color(COLORS['border'])
+
+              ax5 = fig.add_subplot(gs[1, 2]); ax5.set_facecolor(COLORS['card'])
+              groups = defaultdict(list)
+              for s in staleness_data:
+                  if s['versions_behind'] is not None:
+                      g = '.'.join(s['dependency'].split(':')[0].split('.')[:2])
+                      groups[g].append(s['versions_behind'])
+              if groups:
+                  avg = {k: sum(v)/len(v) for k,v in groups.items()}
+                  top = sorted(avg.items(), key=lambda x: -x[1])[:8]
+                  if top:
+                      g, v = zip(*top)
+                      g = [x.replace('androidx.', '').replace('org.', '')[:12] for x in g]
+                      ax5.barh(g, v, color=COLORS['purple'], edgecolor=COLORS['bg'], height=0.6)
+                      ax5.invert_yaxis()
+                      ax5.set_xlabel('Avg Versions Behind', color=COLORS['text'], fontsize=10)
+              ax5.set_title('By Ecosystem', color=COLORS['text'], fontsize=12, pad=10)
+              ax5.tick_params(colors=COLORS['text'])
+              for spine in ax5.spines.values(): spine.set_color(COLORS['border'])
+
+              plt.savefig('update-cadence-graph.png', dpi=150, facecolor=COLORS['bg'],
+                         edgecolor='none', bbox_inches='tight')
+              print("Graph saved!")
+
+              health_score = int((summary['up_to_date'] / max(summary['total'], 1)) * 100)
+              with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
+                  f.write(f'health_score={health_score}\n')
+
+              with open('sbom-summary.md', 'w') as f:
+                  f.write(f'# SBOM Report\n\nHealth: {health_score}% | Total: {summary["total"]}\n\n')
+                  f.write(f'| Status | Count |\n|--------|-------|\n')
+                  f.write(f'| Up to Date | {summary["up_to_date"]} |\n')
+                  f.write(f'| Slight Lag | {summary["slightly_outdated"]} |\n')
+                  f.write(f'| Outdated | {summary["outdated"]} |\n')
+                  f.write(f'| Critical | {summary["very_outdated"]} |\n')
+                  f.write(f'| Unknown | {summary["unknown"]} |\n')
+              print("Done!")
+
+          if __name__ == '__main__':
+              main()
+          PYTHON_SCRIPT
+          python generate_sbom.py
 
       - name: Rename APK for release
         id: release-apk
