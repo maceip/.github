@@ -58,8 +58,6 @@ on:
 
 permissions:
   contents: write
-  id-token: write
-  attestations: write
   issues: read
 
 jobs:
@@ -452,6 +450,7 @@ jobs:
 
       - name: Generate artifact attestations
         uses: actions/attest-build-provenance@v2
+        continue-on-error: true
         with:
           subject-path: |
             ${{ steps.release-apk.outputs.apk_path }}
