@@ -1,0 +1,124 @@
+name: Code Coverage
+
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        description: 'JDK version'
+        type: string
+        default: '21'
+      app-module:
+        description: 'Application module path (e.g. app, android-app-wamr/app)'
+        type: string
+        default: 'app'
+      working-directory:
+        description: 'Working directory for Gradle commands'
+        type: string
+        default: '.'
+      submodules:
+        description: 'Checkout submodules recursively'
+        type: boolean
+        default: false
+      lfs:
+        description: 'Checkout with Git LFS'
+        type: boolean
+        default: false
+      extra-setup-script:
+        description: 'Extra setup commands to run before build'
+        type: string
+        default: ''
+      ndk-version:
+        description: 'Android NDK version (empty to skip)'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: ${{ inputs.submodules && 'recursive' || 'false' }}
+          lfs: ${{ inputs.lfs }}
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: temurin
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        if: inputs.ndk-version != ''
+        run: sdkmanager --install "ndk;${{ inputs.ndk-version }}"
+
+      - name: Extra setup
+        if: inputs.extra-setup-script != ''
+        run: ${{ inputs.extra-setup-script }}
+
+      - name: Fix gradlew permissions
+        working-directory: ${{ inputs.working-directory }}
+        run: chmod +x ./gradlew
+
+      - name: Generate coverage reports
+        working-directory: ${{ inputs.working-directory }}
+        run: ./gradlew koverXmlReportDebug koverHtmlReportDebug --no-daemon
+
+      - name: Upload coverage XML
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: '**/build/reports/kover/debug/report.xml'
+
+      - name: Upload coverage HTML
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: '**/build/reports/kover/debug/html/'
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          XML_FILE=$(find . -path "*/build/reports/kover/debug/report.xml" | head -1)
+          if [ -z "$XML_FILE" ]; then
+            echo "::warning::No Kover XML report found"
+            echo "## Coverage Report" >> "$GITHUB_STEP_SUMMARY"
+            echo "No coverage report generated." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Parse coverage from JaCoCo-format XML
+          MISSED=$(python3 -c "
+          import xml.etree.ElementTree as ET
+          tree = ET.parse('$XML_FILE')
+          root = tree.getroot()
+          for counter in root.findall('counter'):
+              if counter.get('type') == 'LINE':
+                  missed = int(counter.get('missed', 0))
+                  covered = int(counter.get('covered', 0))
+                  total = missed + covered
+                  pct = (covered / total * 100) if total > 0 else 0
+                  print(f'{covered},{total},{pct:.1f}')
+                  break
+          " 2>/dev/null || echo "0,0,0.0")
+
+          COVERED=$(echo "$MISSED" | cut -d, -f1)
+          TOTAL=$(echo "$MISSED" | cut -d, -f2)
+          PCT=$(echo "$MISSED" | cut -d, -f3)
+
+          echo "## Coverage Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Lines covered | $COVERED / $TOTAL |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Coverage | **${PCT}%** |" >> "$GITHUB_STEP_SUMMARY"

@@ -99,6 +99,10 @@ jobs:
         if: inputs.extra-setup-script != ''
         run: ${{ inputs.extra-setup-script }}
 
+      - name: Fix gradlew permissions
+        working-directory: ${{ inputs.working-directory }}
+        run: chmod +x ./gradlew
+
       - name: Run Android Lint
         working-directory: ${{ inputs.working-directory }}
         run: ./gradlew ${{ inputs.lint-task }} --no-daemon
@@ -139,6 +143,10 @@ jobs:
       - name: Extra setup
         if: inputs.extra-setup-script != ''
         run: ${{ inputs.extra-setup-script }}
+
+      - name: Fix gradlew permissions
+        working-directory: ${{ inputs.working-directory }}
+        run: chmod +x ./gradlew
 
       - name: Build APK
         working-directory: ${{ inputs.working-directory }}
@@ -198,6 +206,10 @@ jobs:
       - name: Extra setup
         if: inputs.extra-setup-script != ''
         run: ${{ inputs.extra-setup-script }}
+
+      - name: Fix gradlew permissions
+        working-directory: ${{ inputs.working-directory }}
+        run: chmod +x ./gradlew
 
       - name: Run unit tests
         working-directory: ${{ inputs.working-directory }}
