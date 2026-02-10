@@ -111,11 +111,16 @@ jobs:
       - name: Decode signing keystore
         run: |
           if [ -n "$KEYSTORE_B64" ]; then
-            echo "$KEYSTORE_B64" | base64 -d > keystore.jks
-            echo "KEYSTORE_FILE=$(pwd)/keystore.jks" >> "$GITHUB_ENV"
-            echo "KEYSTORE_PASSWORD=$KS_PASS" >> "$GITHUB_ENV"
-            echo "KEY_ALIAS=$K_ALIAS" >> "$GITHUB_ENV"
-            echo "KEY_PASSWORD=$K_PASS" >> "$GITHUB_ENV"
+            if echo "$KEYSTORE_B64" | base64 -d > keystore.jks 2>/dev/null && [ -s keystore.jks ]; then
+              echo "KEYSTORE_FILE=$(pwd)/keystore.jks" >> "$GITHUB_ENV"
+              echo "KEYSTORE_PASSWORD=$KS_PASS" >> "$GITHUB_ENV"
+              echo "KEY_ALIAS=$K_ALIAS" >> "$GITHUB_ENV"
+              echo "KEY_PASSWORD=$K_PASS" >> "$GITHUB_ENV"
+              echo "Keystore decoded successfully"
+            else
+              echo "::warning::KEYSTORE_BASE64 secret is set but contains invalid base64 data, skipping signing"
+              rm -f keystore.jks
+            fi
           else
             echo "No signing keystore configured, skipping"
           fi
