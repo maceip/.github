@@ -456,16 +456,6 @@ jobs:
           cp "${{ steps.find-apk.outputs.apk_path }}" "$APK_NAME"
           echo "apk_path=$APK_NAME" >> "$GITHUB_OUTPUT"
 
-      - name: Generate artifact attestations
-        uses: actions/attest-build-provenance@v2
-        continue-on-error: true
-        with:
-          subject-path: |
-            ${{ steps.release-apk.outputs.apk_path }}
-            sbom.json
-            staleness-report.json
-            update-cadence-graph.png
-
       - name: Generate release body
         id: release-body
         run: |
