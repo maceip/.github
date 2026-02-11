@@ -222,8 +222,13 @@ jobs:
       - name: Generate dependency report
         working-directory: ${{ inputs.working-directory }}
         run: |
-          ./gradlew ${{ inputs.app-module }}:dependencies --configuration releaseRuntimeClasspath > dependencies-full.txt 2>&1 || true
-          ./gradlew ${{ inputs.app-module }}:dependencies --configuration debugRuntimeClasspath >> dependencies-full.txt 2>&1 || true
+          if [ "${{ inputs.app-module }}" = "." ]; then
+            TASK_PREFIX=":"
+          else
+            TASK_PREFIX="${{ inputs.app-module }}:"
+          fi
+          ./gradlew ${TASK_PREFIX}dependencies --configuration releaseRuntimeClasspath > dependencies-full.txt 2>&1 || true
+          ./gradlew ${TASK_PREFIX}dependencies --configuration debugRuntimeClasspath >> dependencies-full.txt 2>&1 || true
 
       - uses: actions/setup-python@v5
         with:
