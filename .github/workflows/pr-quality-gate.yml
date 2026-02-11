@@ -236,7 +236,7 @@ jobs:
   smoke-test:
     name: Smoke Test
     needs: build
-    if: inputs.package-name != ''
+    if: inputs.package-name != '' && github.event.pull_request.head.repo.fork != true
     runs-on: self-hosted
     concurrency:
       group: emulator
@@ -291,7 +291,7 @@ jobs:
   e2e:
     name: E2E Tests
     needs: build
-    if: inputs.has-instrumentation-tests
+    if: inputs.has-instrumentation-tests && github.event.pull_request.head.repo.fork != true
     runs-on: self-hosted
     concurrency:
       group: emulator
